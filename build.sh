@@ -39,6 +39,11 @@ for p in "$HERE"/patches/sukisu/[0-9][0-9][0-9][0-9]-*.patch; do
   git -C src/KernelSU apply --whitespace=nowarn "$p"
 done
 
+# Versão do KernelSU: a builtin calcula pela contagem de commits da main (~30007), mas o
+# manager instalado exige >= 32513 e o kernel atual é 35008. Fixa em 35008.
+sed -i 's/^KSU_VERSION[[:space:]]*:=.*/KSU_VERSION     := 35008/' src/KernelSU/kernel/Makefile
+grep -q '^KSU_VERSION     := 35008' src/KernelSU/kernel/Makefile || { echo "ERRO: KSU_VERSION nao fixou"; exit 1; }
+
 # 5) Toolchain: Neutron Clang (o kernel original foi feito com Neutron clang 23)
 TC="$WORK/clang"
 if [ ! -x "$TC/bin/clang" ]; then

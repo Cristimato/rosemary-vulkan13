@@ -34,3 +34,16 @@ Você (Claude no Codespace) vai **só compilar** o kernel. Gravar no celular é 
 - **Não** mexa em tabelas de frequência de CPU ou GPU (OC). Isso é feito por módulos separados no aparelho.
 - O boot.img (header v2, kernel gzip + `kernel_dtb` separado) é remontado no celular com magiskboot. Daqui só sai o `Image.gz`.
 - O SukiSU calcula a versão pelo número de commits. Por isso o clone dele precisa de histórico completo.
+
+## Build 2 (pedido do celular, após conferir o build 1)
+O build 1 está OK (r49p1-04eac0 UK 11.46, KSU=y, LTO/CFI off), mas o SukiSU saiu com **KSU_VERSION 30007**.
+O manager instalado tem `MINIMAL_SUPPORTED_KERNEL = 32513` e diria "kernel antigo". O build.sh agora fixa
+`KSU_VERSION := 35008` no `src/KernelSU/kernel/Makefile`. Para não recompilar tudo, faça **incremental**:
+```
+cd ~/kbuild/src
+sed -i 's/^KSU_VERSION[[:space:]]*:=.*/KSU_VERSION     := 35008/' KernelSU/kernel/Makefile
+export PATH="$HOME/kbuild/clang/bin:$PATH"
+make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- -j$(nproc) Image.gz 2>&1 | tee ~/kbuild/build2.log
+grep "version:" ~/kbuild/build2.log     # deve mostrar 35008
+```
+Depois publique `gh release create r49-build2` com `out/arch/arm64/boot/Image.gz`, `out/.config` e o `build2.log`.
