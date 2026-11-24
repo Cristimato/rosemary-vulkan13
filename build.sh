@@ -21,16 +21,23 @@ if [ ! -d src/.git ]; then
 fi
 git -C src fetch -q --depth=1 origin "$BASE"
 git -C src checkout -q -f FETCH_HEAD
-git -C src clean -qfdx
+git -C src clean -qffdx   # -ff: remove também o clone aninhado src/KernelSU de execuções anteriores
 
-# 3) Patch r49p1 + SukiSU hookup
-git -C src apply --whitespace=nowarn "$HERE"/patches/0001-*.patch
+# 3) Patches: 0001 (r49p1 + SukiSU hookup) e correções 0002+ em ordem
+for p in "$HERE"/patches/[0-9][0-9][0-9][0-9]-*.patch; do
+  git -C src apply --whitespace=nowarn "$p"
+done
 
 # 4) SukiSU: o patch cria o symlink KernelSU -> ../vk/sukisu. Substitui por clone real.
 #    Precisa de histórico COMPLETO (kver = 30000 + nº de commits); não usar --depth.
 rm -f src/KernelSU
 git clone -q https://github.com/SukiSU-Ultra/SukiSU-Ultra src/KernelSU
-git -C src/KernelSU checkout -q 1439545f12bffe0263690ba862139b70ee5f20cf
+# Branch builtin = linha non-GKI (4.19). A main (1439545f) é só GKI/kernels novos.
+git -C src/KernelSU checkout -q 4bec532d     # origin/builtin
+# Correções mínimas de compat 4.19 no SukiSU (static_call.h, access_ok de 3 args)
+for p in "$HERE"/patches/sukisu/[0-9][0-9][0-9][0-9]-*.patch; do
+  git -C src/KernelSU apply --whitespace=nowarn "$p"
+done
 
 # 5) Toolchain: Neutron Clang (o kernel original foi feito com Neutron clang 23)
 TC="$WORK/clang"
@@ -51,7 +58,7 @@ make "${MK[@]}" rosemary_defconfig
 scripts/config --file out/.config \
   -e KPROBES -e KPROBE_EVENTS -e KSU -d KSU_MANUAL_HOOK \
   -d LTO_CLANG -d LTO -e LTO_NONE -d CFI_CLANG \
-  -d MTK_GPU_MFG_COUNTER \
+  -d MTK_GPU_MFG_COUNTER -d KPM -d KSU_SUSFS -d KSU_FEATURE_ADBROOT \
   --set-str MTK_GPU_VERSION "mali bifrost r49p1" \
   --set-str LOCALVERSION "-r49" -d LOCALVERSION_AUTO
 make "${MK[@]}" olddefconfig
@@ -68,6 +75,8 @@ make "${MK[@]}" -j"$(nproc)" Image.gz 2>&1 | tee "$WORK/build.log"
 mkdir -p "$HERE/out"
 cp out/arch/arm64/boot/Image.gz out/.config "$HERE/out/"
 cp "$WORK/build.log" "$HERE/out/"
-strings out/vmlinux | grep -m1 "Linux version" | tee "$HERE/out/version.txt"
+# (strings em arquivo antes do grep -m1: com pipefail, o SIGPIPE do strings abortava o script)
+strings out/vmlinux > "$WORK/vmlinux.strings"
+grep -m1 "Linux version" "$WORK/vmlinux.strings" | tee "$HERE/out/version.txt"
 ls -l "$HERE/out"
 echo "OK: $HERE/out/Image.gz"
