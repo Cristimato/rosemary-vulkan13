@@ -74,11 +74,15 @@ grep -q 'CONFIG_MTK_GPU_VERSION="mali bifrost r49p1"' out/.config || { echo "ERR
 grep -q '^CONFIG_KSU=y' out/.config || { echo "ERRO: KSU não ficou =y (KPROBES?)"; exit 1; }
 
 # 7) Build
-make "${MK[@]}" -j"$(nproc)" Image.gz 2>&1 | tee "$WORK/build.log"
+make "${MK[@]}" -j"$(nproc)" Image.gz Image.gz-dtb dtbs 2>&1 | tee "$WORK/build.log"
 
 # 8) Saída
 mkdir -p "$HERE/out"
 cp out/arch/arm64/boot/Image.gz out/.config "$HERE/out/"
+# dtbs da MESMA árvore (build2 usou o dtb do kernel antigo -> bootloop na logo)
+cp out/arch/arm64/boot/Image.gz-dtb "$HERE/out/" 2>/dev/null || true
+find out/arch/arm64/boot/dts/mediatek -maxdepth 1 \( -name "mt6785*.dtb" -o -name "rosemary*.dtb*" \) -exec cp {} "$HERE/out/" \;
+[ -n "$(ls "$HERE"/out/mt6785*.dtb 2>/dev/null)" ] || { echo "ERRO: mt6785.dtb não gerado"; exit 1; }
 cp "$WORK/build.log" "$HERE/out/"
 # (strings em arquivo antes do grep -m1: com pipefail, o SIGPIPE do strings abortava o script)
 strings out/vmlinux > "$WORK/vmlinux.strings"
