@@ -2,9 +2,9 @@
 
 **Vulkan 1.3 na Mali-G76 do POCO M5s / Redmi Note 10S (MT6785, "rosemary"), sem trocar o kernel.**
 
-> **Status: ✅ concluído (2026-11-25).** Naruto Shippuden: Ultimate Ninja Storm 2 (port PC/Xenia,
-> `com.naruto.storm2`) roda em Vulkan na Mali-G76 a ~28 fps (960x540). Antes, o jogo não abria
-> em nenhuma versão do driver original.
+> **Status: ✅ concluído (2026-11-25).** Driver Vulkan 1.3 estável na Mali-G76, validado com uma
+> bateria de testes avançados (veja [Validação](#validação)), incluindo um port de PC com shaders
+> bindless que não abria em nenhuma versão do driver original.
 
 | | Antes (stock) | Depois (este módulo) |
 |---|---|---|
@@ -45,7 +45,7 @@ Três peças:
 3. **vkshim.** A Mali-G76 não suporta `runtimeDescriptorArray`, nem no r32 nem no r49. O port usa
    shaders bindless e `vkCreateGraphicsPipelines` falhava com `VK_ERROR_INITIALIZATION_FAILED`. O
    vkshim intercepta `vkCreateShaderModule` e troca `OpTypeRuntimeArray` de imagem/sampler por
-   `OpTypeArray` de tamanho fixo (8192 imagens / 256 samplers, iguais aos layouts do jogo),
+   `OpTypeArray` de tamanho fixo (8192 imagens / 256 samplers, compatíveis com os layouts usados pelos ports),
    removendo as capabilities e a extensão de descriptor indexing.
 
 Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
@@ -68,6 +68,24 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
    ```
 
 **Desinstalar:** remova o módulo no gerenciador e reinicie (ou `rm -rf /data/adb/modules/vk49_g76`).
+
+## Validação
+
+Testes feitos no aparelho, com o kernel stock:
+
+| Teste | Resultado |
+|---|---|
+| Instância e device pelo loader do sistema (`tools/probe/sysvk`) | ✅ Mali-G76, Vulkan 1.3.278, `vkCreateDevice` OK |
+| Recursos do core 1.3 (`dynamicRendering`, `synchronization2`, `maintenance4`) | ✅ todos ativos |
+| Ordem de carregamento (`/proc/self/maps`) | ✅ loader → vkshim → HAL r49 → `libGLES_ma49.so` |
+| Compute shader: resultado conferido com a CPU e tempo comparado com o r32p1 | ✅ correto, desempenho igual |
+| GLES r32p1 e Vulkan r49p1 no mesmo processo | ✅ sem conflito de símbolos |
+| ABI kbase: r49 (UK 11.46) sobre o kernel r32p1 (UK 11.38) | ✅ só aviso de versão |
+| Patch SPIR-V offline (`shim/spvtest`) em shaders bindless reais | ✅ módulos válidos, pipelines criados |
+| Port de PC com descriptor indexing, testado de ponta a ponta | ✅ renderiza em Vulkan; antes os pipelines falhavam com `VK_ERROR_INITIALIZATION_FAILED` |
+| HAL carregada de forma isolada (`tools/probe/shimvk`), debug ligado e desligado | ✅ |
+| Persistência depois de reboot (overlay do KernelSU) | ✅ |
+| Build reproduzível (`make_module.sh`) comparado com o módulo instalado | ✅ binários idênticos byte a byte |
 
 ## Diagnóstico
 
@@ -111,7 +129,7 @@ docs/              como funciona, histórico, solução de problemas
 O repositório começou como `rosemary-kernel-r49`, com o plano de compilar um kernel com kbase
 r49p1. Os builds funcionaram, mas o boot travava no logo. Os testes mostraram depois que o kernel
 novo **não era necessário**: o blob r49 funciona sobre o kbase r32p1 stock, e o motivo real da
-falha do jogo era o bindless, não a versão do driver. O kit de kernel foi removido (fica no
+falha do port era o bindless, não a versão do driver. O kit de kernel foi removido (fica no
 histórico do git). Relato completo: [docs/HISTORICO.md](docs/HISTORICO.md).
 
 ## Créditos

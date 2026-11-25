@@ -11,4 +11,4 @@
 ## v1.0 — 2026-11-24
 - Blob r49p1 (donor MT6768) com patch de GPU ID → Vulkan 1.3.278 na Mali-G76, kernel stock.
 - vkshim: conversão de runtime descriptor arrays (bindless) para arrays fixos.
-- Naruto Storm 2 (`com.naruto.storm2`) funcionando, ~28 fps em 960x540.
+- Validado de ponta a ponta com um port de PC que usa shaders bindless.

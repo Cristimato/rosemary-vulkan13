@@ -3,7 +3,7 @@
 ## Objetivo
 
 Melhorar o desempenho e ter Vulkan 1.3 na Mali-G76 para a nova leva de ports de jogos de PC para
-Android. O caso concreto: Naruto Storm 2 (`com.naruto.storm2`) não abria no driver stock.
+Android. O port usado como referência não abria no driver stock.
 
 ## Fase 1: kernel r49p1 (abandonada)
 
@@ -27,8 +27,8 @@ era o blob ser de G52.
 1. Probe direto da HAL: `DDK built for 0x7000002 ... not compatible` → o blob donor é de G52.
 2. Patch da checagem de GPU ID → **Mali-G76, Vulkan 1.3.278**. Compute correto.
 3. Módulo `vk49_g76` (v1): só Vulkan, com o GLES no r32p1.
-4. O jogo continuava no r32: o "Umount modules" do perfil do app desmontava o módulo. Desligado →
-   o jogo passou a usar o r49.
+4. Os apps continuavam no r32: o "Umount modules" do perfil do app desmontava o módulo. Desligado →
+   o app passou a usar o r49.
 5. **Mesmo assim falhava**: 32 pipelines com `VK_ERROR_INITIALIZATION_FAILED`, igual ao r32.
 
 ## Fase 3: causa real e vkshim
@@ -36,8 +36,8 @@ era o blob ser de G52.
 - O dump dos pipelines que falhavam mostrou SPIR-V com `RuntimeDescriptorArray`
   (`SPV_EXT_descriptor_indexing`). A G76 tem `runtimeDescriptorArray = 0` em qualquer driver.
 - Fizemos o vkshim (HAL wrapper) para converter esses arrays para tamanho fixo.
-- **Resultado (2026-11-24): Naruto Storm 2 funcionando**, "Vulkan on Mali-G76", ~28 fps em
-  960x540 (0.75x).
+- **Resultado (2026-11-24):** o port passou a renderizar em Vulkan na Mali-G76.
+- Testes avançados de validação: veja a seção *Validação* do README.
 
 ## Fase 4: acabamento (2026-11-25)
 

@@ -49,7 +49,7 @@ a mesma velocidade do r32. `large_page_conf` não existe no kbase r32 e o blob s
 
 ### O problema
 
-O port (Xenia, "shadowZero") cria descriptor sets bindless:
+Ports de PC baseados em renderizadores modernos criam descriptor sets bindless:
 `OpTypeRuntimeArray` de `OpTypeImage`/`OpTypeSampler` com `SPV_EXT_descriptor_indexing`.
 Na Mali-G76, `runtimeDescriptorArray = 0` (no r32 **e** no r49). O resultado:
 
