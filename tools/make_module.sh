@@ -25,7 +25,7 @@ python3 -I "$ROOT/tools/patch_blob.py" "$WORK/donor" "$LIB"
 sh "$ROOT/shim/build.sh" "$LIB/hw/vulkan.mt6785.so"
 
 VER=$(sed -n 's/^version=//p' "$WORK/mod/module.prop")
-ZIP=$OUT/vk49_g76-$VER.zip
+ZIP=$OUT/vk49_g76-$VER.0-KSU.zip
 rm -f "$ZIP"
 (cd "$WORK/mod" && zip -q -r -9 "$ZIP" .)
 rm -rf "$WORK"

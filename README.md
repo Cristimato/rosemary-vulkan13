@@ -57,7 +57,7 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
 **Requisitos:** POCO M5s / Redmi Note 10S (MT6785) com MIUI 14 / Android 12 (vendor
 `V14.0.17.0.TFFMIXM`), root KernelSU/SukiSU ou Magisk, kernel stock (kbase r32p1).
 
-1. Baixe `vk49_g76-v2.zip` na [Release v2.0](../../releases/latest) e instale pelo gerenciador de root.
+1. Baixe **`vk49_g76-v2.0-KSU.zip`** na [Release v2.0](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root.
 2. Reinicie.
 3. **KernelSU/SukiSU:** em cada jogo que vai usar o driver, abra *App Profile* e **desligue
    "Umount modules"**. Sem isso, o namespace do app desmonta o módulo e o jogo volta ao r32p1.
