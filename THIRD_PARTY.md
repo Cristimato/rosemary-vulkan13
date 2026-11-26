@@ -11,3 +11,4 @@
 
 As licenças completas estão nos repositórios de origem. O vkshim, o `clipcull.c`, os scripts e a
 documentação deste repositório são do projeto.
+| MaliBridge (ASEbrahim e colaboradores) | https://github.com/leegao/MaliBridge | GPL-3.0 | só pesquisa: lista de erratas do driver (MK-xx) e técnica de clip por varying + discard; **nenhum código copiado** |

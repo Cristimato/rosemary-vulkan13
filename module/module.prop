@@ -1,6 +1,6 @@
 id=vk49_g76
-name=Vulkan 1.3 r49p1 + vkshim v4 (Mali-G76)
-version=v4
-versionCode=4
+name=Vulkan 1.3 r49p1 + vkshim v4.7 (Mali-G76)
+version=v4.7
+versionCode=47
 author=Cristimato
-description=Vulkan 1.3 (blob r49p1) + vkshim v4: shaders bindless; correções p/ erratas do compilador Mali; ClipDistance/CullDistance sem crash; depthClamp, fillModeNonSolid e multiDrawIndirect emulados; texturas BC1-BC7 na GPU (PixelBC, sem perda); cache de pipelines persistente. GLES continua r32p1. Props: debug.vkshim.fake/.spv/.pcache/.bcn; debug.vkshim=1 p/ diagnóstico.
+description=Vulkan 1.3 (blob r49p1) + vkshim v4.7: shaders bindless; erratas do compilador Mali; ClipDistance (recorte real), depthClamp, gl_DrawID no multiDrawIndirect e wireframe (geometry shader) emulados; correções das erratas do driver MK-16/MK-07/MK-11/MK-06; texturas BC1-BC7 (PixelBC); cache de pipelines. GLES continua r32p1. Props: debug.vkshim.clip/.clamp/.drawid/.nonsolid/.errata/.fake/.spv/.pcache/.bcn.

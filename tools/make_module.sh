@@ -1,7 +1,7 @@
 #!/bin/sh
-# Gera o zip instalável (KernelSU/Magisk) do módulo vk49_g76 v4.
+# Gera o zip instalável (KernelSU/Magisk) do módulo vk49_g76 (vkshim v4.7).
 # Uso: tools/make_module.sh <Mali-r49p1-MT6768-v0.1.0.zip>
-# Saída: out/vk49_g76-v<versão>.0-KSU.zip
+# Saída: out/vk49_g76-<versão>-KSU.zip
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DONOR=${1:?uso: $0 <Mali-r49p1-MT6768-v0.1.0.zip>}
@@ -23,13 +23,13 @@ LIB=$WORK/mod/system/vendor/lib64
 # 2) blob r49p1 patchado (GPU-check + renomes)
 python3 -I "$ROOT/tools/patch_blob.py" "$WORK/donor" "$LIB"
 
-# 3) vkshim v4 como HAL (vulkan.mt6785.so é o nome que o loader procura) + PixelBC
+# 3) vkshim v4.7 como HAL (vulkan.mt6785.so é o nome que o loader procura) + PixelBC
 sh "$ROOT/shim/build.sh" "$LIB/hw/vulkan.mt6785.so" module
 cp "$ROOT/deps/vulkan.pixelbc.so" "$LIB/hw/vulkan.pixelbc.so"
 cp "$ROOT/THIRD_PARTY.md" "$WORK/mod/"
 
 VER=$(sed -n 's/^version=//p' "$WORK/mod/module.prop")
-ZIP=$OUT/vk49_g76-$VER.0-KSU.zip
+ZIP=$OUT/vk49_g76-$VER-KSU.zip
 rm -f "$ZIP"
 (cd "$WORK/mod" && find . -exec touch -d @1795132800 {} + && zip -q -X -r -9 "$ZIP" .)
 rm -rf "$WORK"

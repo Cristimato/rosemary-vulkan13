@@ -1,5 +1,40 @@
 # Changelog
 
+## v4.7 — 2026-11-26
+
+**Recursos que deixam de ser só anunciados** (testados na GPU com `tools/probe/e47`: v4 9/19, v4.7 19/19)
+- `shaderClipDistance`: recorte real. No último estágio antes da rasterização o `gl_ClipDistance`
+  vira varying (location livre) e o fragment shader descarta o pixel quando alguma distância é
+  negativa (`shim/spvemu.c`). Pipelines sem fragment shader e sem escrita de cor ganham um FS mínimo.
+  `maxClipDistances`/`maxCullDistances` passam a informar 8 (o driver dizia 0).
+- `depthClamp`: z de `gl_Position` preso a [0, w] em cada vértice (exato quando a primitiva não
+  cruza near/far; numa que cruza, a profundidade é achatada por vértice).
+- `multiDrawIndirect`: `gl_DrawID` correto. O índice vai num push constant extra do pipeline layout
+  e é gravado antes de cada draw.
+- `fillModeNonSolid`: LINE/POINT por um geometry shader gerado (triângulo -> arestas/vértices,
+  varyings repassadas, Flat do vértice provocante, culling quando cull/front face/viewport são estáticos).
+
+**Erratas do driver r49p1** (nomes da lista do MaliBridge; pesquisa, nenhum código copiado)
+- MK-16 (Arm 3786517): com cull mode dinâmico pontos e linhas sumiam. **Confirmado no aparelho**;
+  o vkshim manda `VK_CULL_MODE_NONE` enquanto um pipeline de pontos/linhas está ligado.
+- MK-07 (Arm 4222073): views 2D/2D array de imagens 3D com `VK_REMAINING_*` ganham contagens explícitas.
+- MK-11 (Arm 4021056): layout de stencil separado vira o layout combinado equivalente
+  (`vkCreateRenderPass2` e renderização dinâmica).
+- MK-06 (Arm 3786926): views usadas em `vkCmdBeginRendering` têm a destruição adiada (fila de 4096).
+- Testadas e **não reproduzidas** neste driver (sem correção): MK-01 (espera interrompida por
+  sinal) e MK-04 (estado dinâmico antes do bind: cull, depth, strides).
+
+**Outros**
+- Shaders inline (maintenance5, SPIR-V no `VkPipelineShaderStageCreateInfo`) passam pelos mesmos
+  patches; antes escapavam do bindless/clipcull.
+- Props novas: `debug.vkshim.clip/.clamp/.drawid/.nonsolid/.errata` (0 = comportamento da v4).
+- Custo medido: ~0,09 µs a mais por `vkCmdBindPipeline`; draws inalterados. O PixelBC já custava
+  ~0,25 µs por `vkCmdPushConstants` (histórico de estado dele); jogos sem texturas BC podem usar
+  `debug.vkshim.bcn=0`.
+- Testes: `tests/run.sh` valida as variantes do `spvemu` (28 módulos, `spirv-val`); probe `e47`.
+
+**Ainda falta:** teste dentro de jogos reais com a v4.7.
+
 ## v4.0 — 2026-11-26
 
 **Corrigido**
