@@ -3,9 +3,10 @@
 **Vulkan 1.3 na Mali-G76 do POCO M5s / Redmi Note 10S (MT6785, "rosemary"), sem trocar o kernel.**
 
 > **Versão atual: v4.0 (2026-11-26).** Blob r49p1 + **vkshim v4**: além dos shaders bindless,
-> corrige bugs do compilador Mali, evita o crash de ClipDistance, emula recursos que faltam na
-> G76, decodifica texturas BC na GPU e guarda os pipelines em cache. Detalhes:
-> [docs/PESQUISA-V4.md](docs/PESQUISA-V4.md). A v2.0 continua disponível nas Releases.
+> corrige bugs do compilador Mali, evita o crash de ClipDistance, anuncia recursos que faltam na
+> G76 (vários sem o efeito real, veja [Limitações](#limitações)), decodifica texturas BC na GPU e
+> guarda os pipelines em cache. Detalhes: [docs/PESQUISA-V4.md](docs/PESQUISA-V4.md). A v2.0
+> continua disponível nas Releases.
 
 | | Stock | v2.0 | **v4.0** |
 |---|---|---|---|
@@ -13,18 +14,31 @@
 | Shaders bindless (`runtimeDescriptorArray`) | ❌ pipeline falha | ✅ convertidos | ✅ convertidos |
 | Shader com `gl_ClipDistance` | ❌ | ❌ **derruba o driver** | ✅ compila (recorte ignorado) |
 | Erratas do compilador Mali (Arm 3843237 e outros) | — | — | ✅ shaders corrigidos |
-| `depthClamp` / `fillModeNonSolid` / `multiDrawIndirect` | ❌ | ❌ | ✅ emulados |
+| `depthClamp` / `fillModeNonSolid` | ❌ | ❌ | ⚠️ anunciados, efeito ignorado |
+| `multiDrawIndirect` | ❌ | ❌ | ⚠️ vira vários draws (`gl_DrawID` = 0) |
 | Texturas BC1–BC7 | ❌ | ❌ | ✅ decodificadas na GPU, sem perda |
 | Cache de pipelines entre sessões | — | — | ✅ (apps sem cache próprio) |
 | GLES / interface / kernel | r32p1 / stock | sem mudança | sem mudança |
 
----|---|---|
-| Driver Vulkan | Mali r32p1 | Mali **r49p1** (DDK r49p1-03bet0) |
-| API Vulkan | 1.1.177 | **1.3.278** |
-| Feature anunciada ao Android | `vulkan.version` 1.1 | `vulkan.version` **1.3** |
-| Shaders bindless (`runtimeDescriptorArray`) | ❌ pipeline falha | ✅ convertidos pelo **vkshim** |
-| GLES / interface do sistema | r32p1 | r32p1 (sem mudança) |
-| Kernel | stock | stock (sem mudança) |
+---
+
+## Limitações
+
+A Mali-G76 não tem esses recursos no hardware/driver. O vkshim os **anuncia** para o jogo não
+recusar o device ou o pipeline, mas **não os implementa como se fossem nativos**:
+
+| Recurso anunciado | O que acontece de fato | Efeito visível possível |
+|---|---|---|
+| `shaderClipDistance` / `shaderCullDistance` | `gl_ClipDistance`/`gl_CullDistance` são retirados do shader | planos de recorte do usuário são ignorados: nada é recortado (água/espelhos/portais podem vazar) |
+| `depthClamp` | o pipeline é criado com `depthClampEnable = VK_FALSE` (também no estado dinâmico) | geometria fora do intervalo de profundidade é cortada em vez de grampeada (buracos em sombras, objetos colados na câmera) |
+| `fillModeNonSolid` | polígonos `LINE`/`POINT` viram `FILL` | wireframe e pontos saem como triângulos cheios |
+| `multiDrawIndirect` | `vkCmdDraw(Indexed)Indirect` com N comandos vira N chamadas de 1 draw | resultado igual, exceto `gl_DrawID`, que fica sempre 0; mais custo de CPU com N alto |
+| Descriptor indexing completo | **não emulado**; só aparece com `debug.vkshim.fake=descidx` (desligado por padrão). O que funciona é a conversão bindless para arrays fixos (8192 imagens / 256 samplers) | jogos com layouts maiores ou indexação não uniforme fora desse padrão podem falhar |
+| `multiViewport`, `vertexPipelineStoresAndAtomics` | não emulados; opcionais, desligados por padrão | anunciá-los faz o jogo escolher um caminho que quebra |
+
+Se um jogo renderizar errado por causa disso, desligue o anúncio com
+`su -c setprop debug.vkshim.fake none` (ou só os que interessam, ex.: `mdi`) e reabra o jogo: ele
+verá a GPU real e pode escolher outro caminho.
 
 ---
 
@@ -64,7 +78,8 @@ Três peças:
 
 4. **vkshim v4.** Corrige shaders para bugs conhecidos do compilador Mali (passes do fork
    [leegao/SPIRV-Tools](https://github.com/leegao/SPIRV-Tools)), retira ClipDistance/CullDistance
-   (que derrubavam o driver), emula depthClamp/fillModeNonSolid/multiDrawIndirect, encadeia o
+   (que derrubavam o driver), anuncia depthClamp/fillModeNonSolid/multiDrawIndirect (com as
+   [limitações](#limitações) acima), encadeia o
    [PixelBC](https://github.com/supplefrog/PixelBC) para texturas BC e mantém um cache de
    pipelines por app.
 
@@ -97,7 +112,7 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md) e
 | Teste | Resultado |
 |---|---|
 | `tools/probe/v4test` na v2: pipeline com ClipDistance | ❌ SIGSEGV dentro do driver |
-| `tools/probe/v4test` na v4: device com recursos emulados, ClipDistance (1 e 2 planos), depthClamp + LINE, compute, `vkCmdDrawIndirect(drawCount=4)` executado na GPU | ✅ |
+| `tools/probe/v4test` na v4: device com recursos anunciados, ClipDistance (1 e 2 planos), depthClamp + LINE, compute, `vkCmdDrawIndirect(drawCount=4)` executado na GPU | ✅ |
 | Perfis `debug.vkshim.fake=all` e `=none` | ✅ |
 | Cache de pipelines (grava, recarrega, valida cabeçalho) | ✅ |
 | Passes Mali em 16 shaders reais de um port: 14 alterados, 0 erros, ~0,85 ms/shader | ✅ válidos (`spirv-val`) |

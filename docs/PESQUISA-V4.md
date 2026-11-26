@@ -43,8 +43,8 @@ depuração da MediaTek.
 |---|---|---|
 | ClipDistance/CullDistance derrubando o driver | `shim/clipcull.c` (nosso): remove os stores, troca loads por zero, corta os membros do `gl_PerVertex`, tira capabilities. Cobre o formato do glslang e variáveis soltas | os planos de recorte são ignorados (nada é recortado) |
 | Bugs do compilador Mali | passes do fork leegao, só quando a varredura acha o padrão | correção, sem mudança visual |
-| depthClamp / fillModeNonSolid / multiViewport | anunciados; o pipeline é saneado (clamp off, polígono FILL, 1 viewport), também no estado dinâmico | aproximado |
-| multiDrawIndirect | anunciado; `vkCmdDraw(Indexed)Indirect` com N comandos vira N draws | exato, exceto `gl_DrawID` = 0 |
+| depthClamp / fillModeNonSolid / multiViewport | anunciados; o pipeline é saneado (clamp off, polígono FILL, 1 viewport), também no estado dinâmico | efeito ignorado (não é aproximação: o clamp é desligado e LINE/POINT vira FILL) |
+| multiDrawIndirect | anunciado; `vkCmdDraw(Indexed)Indirect` com N comandos vira N draws | mesmo resultado, exceto `gl_DrawID` = 0; mais custo de CPU |
 | Texturas BC | PixelBC sem perda encadeado (`vulkan.pixelbc.so`); formatos BC aparecem individualmente | exato (sem perda) |
 | Stutter de compilação | cache de pipelines persistente por app | — |
 | vertexPipelineStoresAndAtomics, descriptor indexing completo | **opcionais** (`debug.vkshim.fake`), desligados por padrão | não emulados |

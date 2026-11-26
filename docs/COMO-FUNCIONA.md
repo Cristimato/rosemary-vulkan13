@@ -123,9 +123,10 @@ Ordem de tratamento de cada shader em `vkCreateShaderModule`:
    com memória workgroup). Sem validador interno; se o driver recusar o resultado, o shader é
    recriado sem esses passes.
 
-Recursos (`vkGetPhysicalDeviceFeatures*`/`Properties*`): os emulados são anunciados e retirados
+Recursos (`vkGetPhysicalDeviceFeatures*`/`Properties*`): os que faltam na G76 são anunciados e retirados
 da criação do device (os structs do app são restaurados depois da chamada). O estado dos
-pipelines é saneado em cópias: nunca escreve nos structs do app.
+pipelines é saneado em cópias: nunca escreve nos structs do app. Sanear quer dizer desligar o
+recurso (clamp off, polígono FILL), não reproduzi-lo; veja Limitações no README.
 
 Cache de pipelines: quando o app passa `VK_NULL_HANDLE`, o vkshim usa um cache próprio em
 `/data/user/0/<pacote>/cache/vkshim_pcache.bin`. Ele é salvo a cada 20 s, se mudou, e no

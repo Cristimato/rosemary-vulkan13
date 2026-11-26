@@ -13,8 +13,10 @@
   recurso anunciado (antes derrubavam o driver ou falhavam).
 
 **Novo**
-- Recursos emulados e anunciados: `depthClamp`, `fillModeNonSolid`, `shaderClipDistance`,
-  `shaderCullDistance`, `multiDrawIndirect` (`maxDrawIndirectCount` = 2^30).
+- Recursos anunciados: `depthClamp`, `fillModeNonSolid`, `shaderClipDistance`,
+  `shaderCullDistance`, `multiDrawIndirect` (`maxDrawIndirectCount` = 2^30). Não são nativos:
+  clamp e polígono LINE/POINT são desligados, clip/cull são retirados e MDI vira N draws
+  (`gl_DrawID` = 0). Veja a seção Limitações do README.
 - Opcionais (`debug.vkshim.fake`): `multiViewport`, `vertexPipelineStoresAndAtomics`, descriptor
   indexing completo + `VK_EXT_descriptor_indexing`.
 - Texturas BC1–BC5/BC7 decodificadas na GPU pelo PixelBC sem perda (`hw/vulkan.pixelbc.so`).
