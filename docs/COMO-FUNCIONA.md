@@ -107,9 +107,9 @@ Para conferir:
 su -c "nsenter -t $(pidof <pacote>) -m ls -la /vendor/lib64/hw/vulkan.mt6785.so"
 ```
 
-## 6. vkshim v4
+## 6. vkshim (v4.7)
 
-Cadeia: `libvulkan` → `hw/vulkan.mt6785.so` (vkshim v4) → `hw/vulkan.pixelbc.so` (PixelBC)
+Cadeia: `libvulkan` → `hw/vulkan.mt6785.so` (vkshim) → `hw/vulkan.pixelbc.so` (PixelBC)
 → `hw/vulkan.r49.so` → `libGLES_ma49.so`.
 
 Ordem de tratamento de cada shader em `vkCreateShaderModule`:
@@ -125,8 +125,26 @@ Ordem de tratamento de cada shader em `vkCreateShaderModule`:
 
 Recursos (`vkGetPhysicalDeviceFeatures*`/`Properties*`): os que faltam na G76 são anunciados e retirados
 da criação do device (os structs do app são restaurados depois da chamada). O estado dos
-pipelines é saneado em cópias: nunca escreve nos structs do app. Sanear quer dizer desligar o
-recurso (clamp off, polígono FILL), não reproduzi-lo; veja Limitações no README.
+pipelines é saneado em cópias: nunca escreve nos structs do app (o driver recebe clamp off e
+polígono FILL).
+
+Emulações na criação do pipeline (v4.7, `shim/spvemu.c`). O SPIR-V de cada módulo fica guardado
+(até 160 MB) para montar variantes quando os estágios do pipeline são conhecidos:
+
+| Recurso | Como | Onde |
+|---|---|---|
+| ClipDistance | no último estágio antes da rasterização o built-in vira variável Private, copiada para varyings vec4 numa location livre a cada fim de vértice; o fragment shader ganha uma função que descarta o pixel se alguma distância < 0 | `do_clip`, `spvemu_fs_clip`, `spvemu_fs_new` |
+| depthClamp | antes de cada fim de vértice: `z = z < 0 ? 0 : (z > w ? w : z)` (comparação + OpSelect, para não cair na errata 3779215 de min/max com 0) | `do_clamp` |
+| gl_DrawID | `vkCreatePipelineLayout` ganha 4 bytes de push constant depois dos ranges do app; as leituras de DrawIndex passam a ler esse membro; antes de cada draw o vkshim grava o índice | `do_drawid`, `my_cpl`, `drawid_set` |
+| fillModeNonSolid | geometry shader gerado a partir das saídas do VS: triângulo → line strip v0 v1 v2 v0 (ou 3 pontos), Flat do vértice 0, culling pelo determinante homogêneo quando cull/front face/viewport são estáticos; `geometryShader` é ligado na criação do device | `spvemu_gs_poly` |
+
+Erratas do driver (estado por command buffer em `vkCmdBindPipeline`/`vkCmdSetCullMode`):
+MK-16 manda `VK_CULL_MODE_NONE` enquanto um pipeline de pontos/linhas com cull dinâmico está
+ligado; MK-07 resolve `VK_REMAINING_*` em views de imagens 3D; MK-11 junta layouts de depth e
+stencil no layout combinado; MK-06 adia a destruição de image views usadas em
+`vkCmdBeginRendering` (fila de 4096, esvaziada antes do `vkDestroyImage` da imagem).
+
+Shaders inline (maintenance5) passam pelo mesmo processamento do `vkCreateShaderModule`.
 
 Cache de pipelines: quando o app passa `VK_NULL_HANDLE`, o vkshim usa um cache próprio em
 `/data/user/0/<pacote>/cache/vkshim_pcache.bin`. Ele é salvo a cada 20 s, se mudou, e no
@@ -140,6 +158,8 @@ Propriedades (lidas quando o app abre a HAL):
 | `debug.vkshim.spv` | 1 | 0 desliga os passes Mali |
 | `debug.vkshim.pcache` | 1 | 0 desliga o cache persistente |
 | `debug.vkshim.bcn` | 1 | 0 tira o PixelBC da cadeia |
+| `debug.vkshim.clip` / `.clamp` / `.drawid` / `.nonsolid` | 1 | 0 desliga a emulação (comportamento da v4) |
+| `debug.vkshim.errata` | 1 | 0 desliga as correções MK-16/07/11/06 |
 | `debug.vkshim` | 0 | 1 liga logs e dump de pipelines que falham |
 
-Detalhes da pesquisa e da validação: [PESQUISA-V4.md](PESQUISA-V4.md).
+Detalhes da pesquisa e da validação: [PESQUISA-V4.md](PESQUISA-V4.md) e [CHANGELOG.md](../CHANGELOG.md) (v4.7).

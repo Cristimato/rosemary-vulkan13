@@ -62,3 +62,8 @@ era o blob ser de G52.
   recursos emulados; cache de pipelines persistente; PixelBC sem perda encadeado.
 - Pacote portátil (v3.0) mudou para o repositório público `mali-g76-vulkan13-portable`, que
   também recebeu a v4.
+- **v4.7 (2026-11-26):** a revisão das limitações mostrou que vários recursos eram só anunciados.
+  Com a pesquisa do MaliBridge (lista de erratas, técnica do discard) e um probe próprio que
+  renderiza e confere pixels (`tools/probe/e47`), clip, depthClamp, gl_DrawID e wireframe passaram
+  a ser emulados, e a errata MK-16 (pontos/linhas sumindo com cull dinâmico) foi confirmada e
+  corrigida. MK-01 e MK-04 foram testadas e não aparecem neste driver.

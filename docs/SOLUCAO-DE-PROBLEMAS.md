@@ -46,20 +46,27 @@ su -c "ls /data/user/0/<pacote>/cache/vkdump"
 - `vkCreateGraphicsPipelines FALHOU -3`: veja `fail_NNN.txt` (estado) e o `.spv` (shader).
   Desmonte com `spirv-dis` e procure capabilities ou recursos que a G76 não tem (ex.: clip/cull
   distance, `depthClamp` e `fillModeNonSolid` são 0 nesta GPU).
-- Layouts com `descriptorCount` maior que 8192/256: ajuste `vkshim.cfg` (`N_IMG N_SMP N_OTHER`).
+- Layouts com `descriptorCount` maior que 8192/256: os limites são fixos em `shim/shim.c`
+  (`N_IMG`, `N_SMP`, `N_OTHER`); é preciso recompilar.
 
+Para conferir erratas e emulações na GPU: `tools/probe/e47/build.sh` e rode o `e47` contra a HAL.
 Para testar os passes de SPIR-V sem rodar o jogo: `tests/run.sh` (shaders de teste) ou
 compile `tests/spvtest.cpp` / `tests/cctest.c` e passe os `.spv` despejados.
 
-## Isolar um problema na v4
+## Isolar um problema
 
-Cada parte do vkshim v4 pode ser desligada sem reinstalar (reabra o jogo depois):
+Cada parte do vkshim pode ser desligada sem reinstalar (reabra o jogo depois):
 
 ```sh
 su -c setprop debug.vkshim.bcn 0       # tira o PixelBC (texturas BC)
 su -c setprop debug.vkshim.spv 0       # desliga os passes Mali de SPIR-V
 su -c setprop debug.vkshim.pcache 0    # desliga o cache de pipelines
 su -c setprop debug.vkshim.fake none   # não anuncia nenhum recurso emulado
+su -c setprop debug.vkshim.clip 0      # v4.7: recorte por discard desligado (planos ignorados)
+su -c setprop debug.vkshim.clamp 0     # v4.7: depthClamp desligado
+su -c setprop debug.vkshim.drawid 0    # v4.7: gl_DrawID por push constant desligado
+su -c setprop debug.vkshim.nonsolid 0  # v4.7: wireframe por geometry shader desligado
+su -c setprop debug.vkshim.errata 0    # v4.7: correções das erratas do driver desligadas
 ```
 
 Se o jogo só funciona com uma delas desligada, abra uma issue com o `logcat -s vkshim`.

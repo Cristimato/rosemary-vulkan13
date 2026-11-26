@@ -65,7 +65,7 @@ verá a GPU real e pode escolher outro caminho.
 app/jogo ──► /system/lib64/libvulkan.so  (loader Android)
                │
                ▼
-          hw/vulkan.mt6785.so   ← vkshim v4: bindless, clip/cull, erratas Mali, recursos
+          hw/vulkan.mt6785.so   ← vkshim v4.7: bindless, erratas Mali/driver, recursos
                │                  emulados, cache de pipelines
                ▼
           hw/vulkan.pixelbc.so  ← PixelBC: texturas BC1–BC7 decodificadas na GPU
@@ -151,7 +151,7 @@ ASan/UBSan nos geradores ✅, 20 mil iterações sem vazamento ✅. **Falta test
 | Cache de pipelines (grava, recarrega, valida cabeçalho) | ✅ |
 | Passes Mali em 16 shaders reais de um port: 14 alterados, 0 erros, ~0,85 ms/shader | ✅ válidos (`spirv-val`) |
 | PixelBC sem perda na G76: probe BC1–BC5 / probe BC7 | ✅ 535/0 · 20046/0 |
-| Cadeia vkshim v4 → PixelBC → r49 | ✅ |
+| Cadeia vkshim → PixelBC → r49 | ✅ |
 | Build reproduzível (`make_module.sh`) | ✅ idêntico ao pacote testado |
 
 Ainda falta: teste dentro de jogos reais com a v4.
