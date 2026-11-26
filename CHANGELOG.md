@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.0 — 2026-11-26 — pacote portátil
+- Novo **`vk49_g76-v3.0-portatil.zip`**: driver ZIP importável (meta.json na raiz) para launchers
+  estilo adrenotools. Traz vkshim + HAL r49 + blob; não precisa de módulo nem root.
+- vkshim: build `portable` (`shim/build.sh <saida> portable`) procura `vulkan.r49.so` na pasta do
+  pacote, ao lado do próprio `.so` e, por último, em `/vendor/lib64/hw`.
+- `meta.json` com `backend: panvk` / `panvkFrontend: bifrost-jm` / `gpuModels: [G76]` para passar
+  no filtro de família desses launchers (antes o pacote era recusado como família "Unknown").
+- `tools/make_portable.sh`: build reproduzível do pacote. O módulo KSU (v2.0) não mudou
+  (vkshim do módulo continua byte a byte igual).
+
 ## v2.0 — 2026-11-25
 - vkshim v2: intercepta só `vkCreateShaderModule` e `vkCreateGraphicsPipelines` no uso normal;
   sem cópia de SPIR-V nem logs por chamada.

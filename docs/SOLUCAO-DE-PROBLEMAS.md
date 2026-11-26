@@ -58,3 +58,17 @@ clang -O2 -o spvtest shim/spvtest.c -ldl -llog
 
 Remova o módulo no gerenciador de root e reinicie. O módulo não muda nada fora do overlay de
 `/vendor`.
+
+## Launcher recusa o driver ZIP ("Unknown driver family" / "families do not match")
+
+Launchers estilo adrenotools classificam o pacote pelo texto de `backend`, `name` e `libraryName`
+do `meta.json` (procuram "turnip", "panvk", "radv", "pvr"…). Um pacote só com "Mali r49" cai como
+família **Unknown** e é recusado. Use o **`vk49_g76-v3.0-portatil.zip`** (já vem com
+`backend: panvk`, `panvkFrontend: bifrost-jm`, `gpuModels: [G76]`).
+
+Outro erro comum: importar **só** o `vulkan.mt6785.so` do módulo. Ele depende do HAL
+`/vendor/lib64/hw/vulkan.r49.so`, que não fica visível no namespace do driver importado; o pacote
+portátil traz o HAL e o blob junto.
+
+Se o driver aparecer mas falhar ao carregar, veja `logcat -s vkshim`: a linha
+`vkshim v2 ativo sobre …` diz de onde o HAL foi aberto.
