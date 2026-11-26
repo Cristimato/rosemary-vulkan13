@@ -106,3 +106,39 @@ Para conferir:
 ```sh
 su -c "nsenter -t $(pidof <pacote>) -m ls -la /vendor/lib64/hw/vulkan.mt6785.so"
 ```
+
+## 6. vkshim v4
+
+Cadeia: `libvulkan` → `hw/vulkan.mt6785.so` (vkshim v4) → `hw/vulkan.pixelbc.so` (PixelBC)
+→ `hw/vulkan.r49.so` → `libGLES_ma49.so`.
+
+Ordem de tratamento de cada shader em `vkCreateShaderModule`:
+
+1. **Bindless** (v2): `OpTypeRuntimeArray` de imagem/sampler → array fixo.
+2. **Clip/cull** (`shim/clipcull.c`): só se o módulo tem a capability `ClipDistance`/`CullDistance`
+   ou variáveis soltas com esses built-ins. Se aparecer qualquer uso não reconhecido, o módulo
+   segue inalterado.
+3. **Passes Mali** (`shim/spvfix.cpp`, fork leegao/SPIRV-Tools): uma varredura escolhe só os
+   passes cujo padrão existe no módulo (spec constants, shifts/bitwise, min/max/clamp, compute
+   com memória workgroup). Sem validador interno; se o driver recusar o resultado, o shader é
+   recriado sem esses passes.
+
+Recursos (`vkGetPhysicalDeviceFeatures*`/`Properties*`): os emulados são anunciados e retirados
+da criação do device (os structs do app são restaurados depois da chamada). O estado dos
+pipelines é saneado em cópias: nunca escreve nos structs do app.
+
+Cache de pipelines: quando o app passa `VK_NULL_HANDLE`, o vkshim usa um cache próprio em
+`/data/user/0/<pacote>/cache/vkshim_pcache.bin`. Ele é salvo a cada 20 s, se mudou, e no
+`vkDestroyDevice`. O cabeçalho (vendor, device, UUID) é conferido antes de carregar.
+
+Propriedades (lidas quando o app abre a HAL):
+
+| Prop | Padrão | Efeito |
+|---|---|---|
+| `debug.vkshim.fake` | `depthclamp,nonsolid,clipdist,mdi` | lista de recursos anunciados; também `multivp`, `vsstores`, `descidx`, `all`, `none` |
+| `debug.vkshim.spv` | 1 | 0 desliga os passes Mali |
+| `debug.vkshim.pcache` | 1 | 0 desliga o cache persistente |
+| `debug.vkshim.bcn` | 1 | 0 tira o PixelBC da cadeia |
+| `debug.vkshim` | 0 | 1 liga logs e dump de pipelines que falham |
+
+Detalhes da pesquisa e da validação: [PESQUISA-V4.md](PESQUISA-V4.md).

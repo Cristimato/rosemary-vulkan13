@@ -48,11 +48,22 @@ su -c "ls /data/user/0/<pacote>/cache/vkdump"
   distance, `depthClamp` e `fillModeNonSolid` são 0 nesta GPU).
 - Layouts com `descriptorCount` maior que 8192/256: ajuste `vkshim.cfg` (`N_IMG N_SMP N_OTHER`).
 
-Para testar o patch SPIR-V sem o aparelho rodando o jogo:
+Para testar os passes de SPIR-V sem rodar o jogo: `tests/run.sh` (shaders de teste) ou
+compile `tests/spvtest.cpp` / `tests/cctest.c` e passe os `.spv` despejados.
+
+## Isolar um problema na v4
+
+Cada parte do vkshim v4 pode ser desligada sem reinstalar (reabra o jogo depois):
+
 ```sh
-clang -O2 -o spvtest shim/spvtest.c -ldl -llog
-./spvtest entrada.spv saida.spv && spirv-val saida.spv
+su -c setprop debug.vkshim.bcn 0       # tira o PixelBC (texturas BC)
+su -c setprop debug.vkshim.spv 0       # desliga os passes Mali de SPIR-V
+su -c setprop debug.vkshim.pcache 0    # desliga o cache de pipelines
+su -c setprop debug.vkshim.fake none   # não anuncia nenhum recurso emulado
 ```
+
+Se o jogo só funciona com uma delas desligada, abra uma issue com o `logcat -s vkshim`.
+Para apagar o cache de um jogo: `rm /data/user/0/<pacote>/cache/vkshim_pcache.bin`.
 
 ## Voltar ao estado stock
 

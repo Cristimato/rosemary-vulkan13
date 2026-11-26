@@ -1,0 +1,25 @@
+diff --git a/src/wrapper.cpp b/src/wrapper.cpp
+index 58862bc..67c7a83 100644
+--- a/src/wrapper.cpp
++++ b/src/wrapper.cpp
+@@ -356,8 +356,19 @@ extern "C" EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice,con
+ namespace {
+ void initialize_backend() {
+ #ifdef __ANDROID__
+-    backend.path="/vendor/lib64/hw/vulkan.mali.so";
++#ifndef PVB_BACKEND_PATH
++#define PVB_BACKEND_PATH "/vendor/lib64/hw/vulkan.r49.so"
++#endif
++    backend.path=PVB_BACKEND_PATH;
+     backend.library=dlopen(backend.path.c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!backend.library && backend.path.find('/')==std::string::npos) {
++        // pacote portátil: backend ao lado desta biblioteca
++        Dl_info info{};
++        if(dladdr(reinterpret_cast<const void*>(&HMI),&info) && info.dli_fname) {
++            std::string self=info.dli_fname; auto slash=self.rfind('/');
++            if(slash!=std::string::npos) { backend.path=self.substr(0,slash+1)+backend.path; backend.library=dlopen(backend.path.c_str(),RTLD_NOW|RTLD_LOCAL); }
++        }
++    }
+     if(!backend.library) { log_error(dlerror()); return; }
+     auto module=static_cast<hw_module_t*>(dlsym(backend.library,"HMI"));
+     if(!module || module==&HMI.common || module->tag!=HARDWARE_MODULE_TAG || module->module_api_version!=HWVULKAN_MODULE_API_VERSION_0_1 || module->hal_api_version!=HARDWARE_HAL_API_VERSION || !module->id || std::strcmp(module->id,"vulkan") || !module->methods || !module->methods->open) { log_error("Stock Mali HAL module unavailable"); return; }

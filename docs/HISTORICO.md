@@ -50,3 +50,15 @@ era o blob ser de G52.
 
 - Kernel r49p1: não é necessário. O kit está no histórico do git (commits até `71c1943`).
 - GLES r49: não testado como driver do sistema; o r32p1 segue estável para a interface.
+
+## Fase 5: v4 (2026-11-26)
+
+- Pesquisa sobre o que falta no r49 da G76 e como outros projetos contornam isso no Mali de
+  fábrica (wrapper e fork do SPIRV-Tools do leegao, PixelBC). Resumo em [PESQUISA-V4.md](PESQUISA-V4.md).
+- Teste de ponta a ponta (`tools/probe/v4test`) mostrou que, na v2, um shader com ClipDistance
+  derrubava o driver. O passe do leegao não cobria o formato do glslang, então foi escrito o
+  `clipcull.c`.
+- Passes Mali do fork linkados no vkshim (libc++ estático para caber no namespace sphal);
+  recursos emulados; cache de pipelines persistente; PixelBC sem perda encadeado.
+- Pacote portátil (v3.0) mudou para o repositório público `mali-g76-vulkan13-portable`, que
+  também recebeu a v4.

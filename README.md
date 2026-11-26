@@ -2,12 +2,23 @@
 
 **Vulkan 1.3 na Mali-G76 do POCO M5s / Redmi Note 10S (MT6785, "rosemary"), sem trocar o kernel.**
 
-> **Status: ✅ concluído (2026-11-25).** Driver Vulkan 1.3 estável na Mali-G76, validado com uma
-> bateria de testes avançados (veja [Validação](#validação)), incluindo um port de PC com shaders
-> bindless que não abria em nenhuma versão do driver original.
+> **Versão atual: v4.0 (2026-11-26).** Blob r49p1 + **vkshim v4**: além dos shaders bindless,
+> corrige bugs do compilador Mali, evita o crash de ClipDistance, emula recursos que faltam na
+> G76, decodifica texturas BC na GPU e guarda os pipelines em cache. Detalhes:
+> [docs/PESQUISA-V4.md](docs/PESQUISA-V4.md). A v2.0 continua disponível nas Releases.
 
-| | Antes (stock) | Depois (este módulo) |
-|---|---|---|
+| | Stock | v2.0 | **v4.0** |
+|---|---|---|---|
+| Driver / API Vulkan | r32p1 / 1.1.177 | r49p1 / 1.3.278 | r49p1 / **1.3.278** |
+| Shaders bindless (`runtimeDescriptorArray`) | ❌ pipeline falha | ✅ convertidos | ✅ convertidos |
+| Shader com `gl_ClipDistance` | ❌ | ❌ **derruba o driver** | ✅ compila (recorte ignorado) |
+| Erratas do compilador Mali (Arm 3843237 e outros) | — | — | ✅ shaders corrigidos |
+| `depthClamp` / `fillModeNonSolid` / `multiDrawIndirect` | ❌ | ❌ | ✅ emulados |
+| Texturas BC1–BC7 | ❌ | ❌ | ✅ decodificadas na GPU, sem perda |
+| Cache de pipelines entre sessões | — | — | ✅ (apps sem cache próprio) |
+| GLES / interface / kernel | r32p1 / stock | sem mudança | sem mudança |
+
+---|---|---|
 | Driver Vulkan | Mali r32p1 | Mali **r49p1** (DDK r49p1-03bet0) |
 | API Vulkan | 1.1.177 | **1.3.278** |
 | Feature anunciada ao Android | `vulkan.version` 1.1 | `vulkan.version` **1.3** |
@@ -23,7 +34,10 @@
 app/jogo ──► /system/lib64/libvulkan.so  (loader Android)
                │
                ▼
-          hw/vulkan.mt6785.so   ← vkshim: reescreve SPIR-V bindless → arrays de tamanho fixo
+          hw/vulkan.mt6785.so   ← vkshim v4: bindless, clip/cull, erratas Mali, recursos
+               │                  emulados, cache de pipelines
+               ▼
+          hw/vulkan.pixelbc.so  ← PixelBC: texturas BC1–BC7 decodificadas na GPU
                │
                ▼
           hw/vulkan.r49.so      ← HAL Vulkan r49p1 (donor MT6768, NEEDED renomeado)
@@ -48,7 +62,14 @@ Três peças:
    `OpTypeArray` de tamanho fixo (8192 imagens / 256 samplers, compatíveis com os layouts usados pelos ports),
    removendo as capabilities e a extensão de descriptor indexing.
 
-Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
+4. **vkshim v4.** Corrige shaders para bugs conhecidos do compilador Mali (passes do fork
+   [leegao/SPIRV-Tools](https://github.com/leegao/SPIRV-Tools)), retira ClipDistance/CullDistance
+   (que derrubavam o driver), emula depthClamp/fillModeNonSolid/multiDrawIndirect, encadeia o
+   [PixelBC](https://github.com/supplefrog/PixelBC) para texturas BC e mantém um cache de
+   pipelines por app.
+
+Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md) e
+[docs/PESQUISA-V4.md](docs/PESQUISA-V4.md).
 
 ---
 
@@ -57,7 +78,7 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
 **Requisitos:** POCO M5s / Redmi Note 10S (MT6785) com MIUI 14 / Android 12 (vendor
 `V14.0.17.0.TFFMIXM`), root KernelSU/SukiSU ou Magisk, kernel stock (kbase r32p1).
 
-1. Baixe **`vk49_g76-v2.0-KSU.zip`** na [Release v2.0](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root.
+1. Baixe **`vk49_g76-v4.0-KSU.zip`** na [Release mais recente](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root. A v4 substitui a v2 (mesmo id de módulo).
 2. Reinicie.
 3. **KernelSU/SukiSU:** em cada jogo que vai usar o driver, abra *App Profile* e **desligue
    "Umount modules"**. Sem isso, o namespace do app desmonta o módulo e o jogo volta ao r32p1.
@@ -70,6 +91,23 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
 **Desinstalar:** remova o módulo no gerenciador e reinicie (ou `rm -rf /data/adb/modules/vk49_g76`).
 
 ## Validação
+
+### v4.0
+
+| Teste | Resultado |
+|---|---|
+| `tools/probe/v4test` na v2: pipeline com ClipDistance | ❌ SIGSEGV dentro do driver |
+| `tools/probe/v4test` na v4: device com recursos emulados, ClipDistance (1 e 2 planos), depthClamp + LINE, compute, `vkCmdDrawIndirect(drawCount=4)` executado na GPU | ✅ |
+| Perfis `debug.vkshim.fake=all` e `=none` | ✅ |
+| Cache de pipelines (grava, recarrega, valida cabeçalho) | ✅ |
+| Passes Mali em 16 shaders reais de um port: 14 alterados, 0 erros, ~0,85 ms/shader | ✅ válidos (`spirv-val`) |
+| PixelBC sem perda na G76: probe BC1–BC5 / probe BC7 | ✅ 535/0 · 20046/0 |
+| Cadeia vkshim v4 → PixelBC → r49 | ✅ |
+| Build reproduzível (`make_module.sh`) | ✅ idêntico ao pacote testado |
+
+Ainda falta: teste dentro de jogos reais com a v4.
+
+### v2.0
 
 Testes feitos no aparelho, com o kernel stock:
 
@@ -87,6 +125,20 @@ Testes feitos no aparelho, com o kernel stock:
 | Persistência depois de reboot (overlay do KernelSU) | ✅ |
 | Build reproduzível (`make_module.sh`) comparado com o módulo instalado | ✅ binários idênticos byte a byte |
 
+## Ajustes (v4)
+
+Cada parte pode ser desligada sem reinstalar; vale para apps abertos depois:
+
+| Prop | Padrão | Efeito |
+|---|---|---|
+| `debug.vkshim.fake` | `depthclamp,nonsolid,clipdist,mdi` | recursos anunciados (também `multivp`, `vsstores`, `descidx`, `all`, `none`) |
+| `debug.vkshim.spv` | `1` | `0` desliga os passes Mali de SPIR-V |
+| `debug.vkshim.pcache` | `1` | `0` desliga o cache de pipelines |
+| `debug.vkshim.bcn` | `1` | `0` tira o PixelBC (texturas BC) |
+
+`vsstores` e `descidx` ficam desligados por padrão porque não são emulados de verdade: anunciados,
+fazem o jogo escolher um caminho que depois falha.
+
 ## Diagnóstico
 
 O vkshim não gera logs pesados por padrão. Para ligar o modo de diagnóstico:
@@ -102,9 +154,10 @@ layouts, pools e alocações. Veja [docs/SOLUCAO-DE-PROBLEMAS.md](docs/SOLUCAO-D
 ## Build a partir do código
 
 ```sh
-# precisa: clang (Termux ou NDK), headers Vulkan, patchelf, python3, unzip, zip
-tools/make_module.sh Mali-r49p1-MT6768-v0.1.0.zip
-# -> out/vk49_g76-v2.zip
+# precisa: clang/clang++, cmake, ninja, git, glslangValidator, headers Vulkan, patchelf, python3, zip
+tools/build_deps.sh                                  # SPIRV-Tools (fork) + PixelBC, commits fixos
+tools/make_module.sh Mali-r49p1-MT6768-v0.1.0.zip    # -> out/vk49_g76-v4.0-KSU.zip
+tests/run.sh                                         # testes offline dos passes SPIR-V
 ```
 
 O zip donor (`Mali-r49p1-MT6768-v0.1.0.zip`, sha256 `0b5d439f…fd1c6a`) vem do projeto
@@ -116,12 +169,16 @@ os binários gerados são idênticos aos da release.
 
 ```
 module/            template do módulo (module.prop, customize.sh, xml de feature 1.3)
-shim/              vkshim (HAL wrapper) + spvtest (testa o patch SPIR-V offline)
+shim/              vkshim v4: shim.c, clipcull.c (clip/cull), spvfix.cpp (passes Mali)
+patches/           patch do PixelBC (caminho do backend)
+tests/             shaders de teste + run.sh (validação offline)
 tools/
+  build_deps.sh    baixa e compila SPIRV-Tools (fork leegao) e PixelBC em commits fixos
   make_module.sh   monta o zip instalável
   patch_blob.py    patches binários do blob r49p1 (com verificação)
-  probe/           sysvk (via loader do sistema) e shimvk (carrega um shim direto)
-docs/              como funciona, histórico, solução de problemas
+  probe/           sysvk, shimvk, fullvk (recursos/limites/formatos), v4test (ponta a ponta)
+docs/              como funciona, pesquisa da v4, histórico, solução de problemas
+THIRD_PARTY.md     componentes de terceiros e licenças
 ```
 
 ## Histórico
@@ -137,4 +194,7 @@ histórico do git). Relato completo: [docs/HISTORICO.md](docs/HISTORICO.md).
 - **Dracen-W**, pelo port r49p1 para MT6768 (blob donor + libgpud shim).
 - **ARM**: os blobs Mali são proprietários e **não estão neste repositório**. Só a release os
   redistribui, como o módulo original do Dracen-W.
-- vkshim, scripts e documentação: este projeto.
+- **leegao**, pelo fork do SPIRV-Tools com os passes para o compilador Mali e pela pesquisa do
+  bionic-vulkan-wrapper.
+- **supplefrog**, pelo PixelBC (MIT).
+- vkshim, `clipcull.c`, scripts e documentação: este projeto. Veja [THIRD_PARTY.md](THIRD_PARTY.md).
