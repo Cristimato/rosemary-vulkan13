@@ -389,31 +389,8 @@ static int my_close(hw_device_t *d) { (void)d; return real_dev->common.close(&re
 static int my_open(const hw_module_t *mod, const char *id, hw_device_t **out) {
     char pv[PROP_VALUE_MAX] = {0};
     if (__system_property_get("debug.vkshim", pv) > 0 && pv[0] == '1') dbg = 1;
-#ifdef PORTABLE
-    /* Pacote portatil (driver importado no app, namespace do adrenotools-like):
-     * 1) pelo nome, no namespace do proprio driver (pasta do pacote);
-     * 2) caminho absoluto ao lado deste .so;
-     * 3) HAL do modulo vk49_g76, se instalado. */
-    const char *which = "vulkan.r49.so";
-    void *h = dlopen(which, RTLD_NOW | RTLD_LOCAL);
-    char side[512];
-    if (!h) {
-        LOGI("dlopen %s: %s", which, dlerror());
-        Dl_info di;
-        if (dladdr((const void *)mod, &di) && di.dli_fname) {
-            snprintf(side, sizeof side, "%s", di.dli_fname);
-            char *sl = strrchr(side, '/');
-            if (sl) { strcpy(sl + 1, "vulkan.r49.so"); which = side; h = dlopen(which, RTLD_NOW | RTLD_LOCAL); }
-            if (!h) LOGI("dlopen %s: %s", which, dlerror());
-        }
-    }
-    if (!h) { which = REAL_HAL; h = dlopen(which, RTLD_NOW | RTLD_LOCAL); }
-    if (!h) { LOGE("dlopen %s: %s", which, dlerror()); return -1; }
-#else
-    const char *which = REAL_HAL;
     void *h = dlopen(REAL_HAL, RTLD_NOW | RTLD_LOCAL);
     if (!h) { LOGE("dlopen %s: %s", REAL_HAL, dlerror()); return -1; }
-#endif
     hw_module_t *rm = dlsym(h, "HMI");
     if (!rm) { LOGE("sem HMI"); return -1; }
     hw_device_t *rd = NULL;
@@ -426,7 +403,7 @@ static int my_open(const hw_module_t *mod, const char *id, hw_device_t **out) {
     my_dev.common.close = my_close;
     my_dev.GetInstanceProcAddr = my_gipa;
     *out = &my_dev.common;
-    LOGI("vkshim v2 ativo sobre %s (debug %s)", which, dbg ? "ON" : "off");
+    LOGI("vkshim v2 ativo sobre %s (debug %s)", REAL_HAL, dbg ? "ON" : "off");
     return 0;
 }
 

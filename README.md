@@ -57,7 +57,7 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
 **Requisitos:** POCO M5s / Redmi Note 10S (MT6785) com MIUI 14 / Android 12 (vendor
 `V14.0.17.0.TFFMIXM`), root KernelSU/SukiSU ou Magisk, kernel stock (kbase r32p1).
 
-1. Baixe **`vk49_g76-v2.0-KSU.zip`** na [Release v2.0](../../releases/tag/v2.0) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root.
+1. Baixe **`vk49_g76-v2.0-KSU.zip`** na [Release v2.0](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root.
 2. Reinicie.
 3. **KernelSU/SukiSU:** em cada jogo que vai usar o driver, abra *App Profile* e **desligue
    "Umount modules"**. Sem isso, o namespace do app desmonta o módulo e o jogo volta ao r32p1.
@@ -68,33 +68,6 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md).
    ```
 
 **Desinstalar:** remova o módulo no gerenciador e reinicie (ou `rm -rf /data/adb/modules/vk49_g76`).
-
-## Pacote portátil (sem módulo, sem root)
-
-Para apps/launchers que deixam **importar um driver Vulkan em ZIP** (estilo adrenotools,
-"Import driver ZIP" com `meta.json` na raiz), existe o **`vk49_g76-v3.0-portatil.zip`**. Ele traz
-tudo dentro (vkshim + HAL r49 + blob patchado) e o app carrega o driver da própria pasta:
-**não precisa do módulo, nem de root, nem de mexer em "Umount modules"**.
-
-1. Baixe `vk49_g76-v3.0-portatil.zip` na [Release v3.0](../../releases/latest).
-2. No app, importe o ZIP na tela de drivers e selecione **"Mali-G76 r49p1 Vulkan 1.3 (vkshim)"**.
-
-```
-jogo ──► ANGLE / loader do app ──► <pasta do driver>/vulkan.mali_r49.so  (vkshim portátil)
-                                          │  dlopen("vulkan.r49.so") na mesma pasta
-                                          ▼
-                                    vulkan.r49.so ──► libGLES_ma49.so ──► /dev/mali0
-```
-
-Observações:
-
-- O `meta.json` declara `"backend": "panvk"` e `"panvkFrontend": "bifrost-jm"` **só para passar no
-  filtro de família** desses launchers (eles só reconhecem Turnip/PanVK/RADV/PowerVR pelo texto e
-  recusam o resto como "Unknown driver family"). O driver é o blob ARM, não Mesa.
-- Se o app tiver um driver "System" e o **módulo** estiver instalado, o "System" já é este mesmo
-  Vulkan 1.3; o portátil serve para quem não tem root/módulo ou para apps que só usam driver importado.
-- O vkshim portátil procura `vulkan.r49.so` nesta ordem: pelo nome (pasta do pacote) → ao lado do
-  próprio `.so` → `/vendor/lib64/hw/vulkan.r49.so` (módulo).
 
 ## Validação
 
@@ -113,8 +86,6 @@ Testes feitos no aparelho, com o kernel stock:
 | HAL carregada de forma isolada (`tools/probe/shimvk`), debug ligado e desligado | ✅ |
 | Persistência depois de reboot (overlay do KernelSU) | ✅ |
 | Build reproduzível (`make_module.sh`) comparado com o módulo instalado | ✅ binários idênticos byte a byte |
-| Pacote portátil: vkshim carregando o HAL r49 da pasta do pacote (`shimvk`, sem `/vendor/lib64/hw` no path) | ✅ Mali-G76, Vulkan 1.3.278 |
-| Pacote portátil: `meta.json` conferido contra as regras de importação do launcher (família, modelo, ABI, limites do ZIP) | ✅ |
 
 ## Diagnóstico
 
@@ -132,8 +103,8 @@ layouts, pools e alocações. Veja [docs/SOLUCAO-DE-PROBLEMAS.md](docs/SOLUCAO-D
 
 ```sh
 # precisa: clang (Termux ou NDK), headers Vulkan, patchelf, python3, unzip, zip
-tools/make_module.sh   Mali-r49p1-MT6768-v0.1.0.zip   # -> out/vk49_g76-v2.0-KSU.zip  (módulo)
-tools/make_portable.sh Mali-r49p1-MT6768-v0.1.0.zip   # -> out/vk49_g76-v3.0-portatil.zip
+tools/make_module.sh Mali-r49p1-MT6768-v0.1.0.zip
+# -> out/vk49_g76-v2.zip
 ```
 
 O zip donor (`Mali-r49p1-MT6768-v0.1.0.zip`, sha256 `0b5d439f…fd1c6a`) vem do projeto
@@ -147,8 +118,7 @@ os binários gerados são idênticos aos da release.
 module/            template do módulo (module.prop, customize.sh, xml de feature 1.3)
 shim/              vkshim (HAL wrapper) + spvtest (testa o patch SPIR-V offline)
 tools/
-  make_module.sh   monta o zip instalável (módulo KSU/Magisk)
-  make_portable.sh monta o pacote portátil (driver ZIP importável)
+  make_module.sh   monta o zip instalável
   patch_blob.py    patches binários do blob r49p1 (com verificação)
   probe/           sysvk (via loader do sistema) e shimvk (carrega um shim direto)
 docs/              como funciona, histórico, solução de problemas
