@@ -1,6 +1,6 @@
 id=vk49_g76
-name=Vulkan 1.3 r49p1 + vkshim v5.0 (Mali-G76)
-version=v5.0
-versionCode=50
+name=Vulkan 1.3 r49p1 + vkshim v5.7 (Mali-G76)
+version=v5.7
+versionCode=57
 author=Cristimato
-description=Vulkan 1.3 (blob r49p1) + vkshim v5.0: robustness2 (nullDescriptor), push descriptors, descriptor indexing completo (waterfall), draw_indirect_count, depthClamp exato, depth_clip_enable/control, multi draw, memory budget, clip/wireframe/gl_DrawID emulados, erratas Mali, BC1-BC7 (PixelBC), cache de pipelines, HUD e config por jogo (vkshim-conf/vkshim-hud). GLES continua r32p1.
+description=Vulkan 1.3 (blob r49p1) + vkshim v5.7: tudo da v5.0 (robustness2, push descriptors, descriptor indexing, draw_indirect_count, depthClamp exato, depth_clip_enable/control, multi draw, BC1-BC7, cache de pipelines) + desempenho por jogo no vkshim.conf: limitador de FPS com ritmo estável (fps=), samplers mais baratos (aniso=, mip=near, lodbias=), FP16 experimental (fp16=1), HUD (vkshim-hud). GLES continua r32p1.

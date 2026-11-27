@@ -1,5 +1,37 @@
 # Changelog
 
+## v5.7 — 2026-11-27
+
+Primeira versão de desempenho. Tudo é por jogo no `vkshim.conf` (ou prop `debug.vkshim.<chave>`) e
+desligado por padrão: o vkshim não muda a imagem de ninguém sem pedido.
+- `fps=N`: limitador com ritmo estável. Cada apresentação sai num horário fixo (relógio absoluto,
+  `clock_nanosleep`); atraso de mais de um quadro reinicia o relógio. BT3 no menu com `fps=30`:
+  30,0 fps, mediana 33,3 ms, p95 34,9 ms.
+- `aniso=N` (teto da anisotropia; 0 desliga), `mip=near` (trilinear -> bilinear), `lodbias=f`.
+- `fp16=1` (experimental): passe novo `spvemu_fp16` marca `RelaxedPrecision` nos fragment shaders,
+  menos o que alimenta coordenadas de textura e `gl_FragDepth` (fatia para trás no SPIR-V).
+- `turbo=1`: chave lida pelo Game Mode do rosemary (piso dos núcleos grandes em 2112 MHz); o
+  vkshim só aceita a chave.
+- Probe novo `tools/probe/p57`: benchmark de GPU (1280x720, 4 desenhos de tela cheia, mediana de
+  40 quadros) com comparação de qualidade por PSNR (`p57 cmp`).
+
+**Medições (p57, Mali-G76 a 955 MHz)**
+
+| Carga / ajuste | ms/quadro | ganho | qualidade |
+|---|---|---|---|
+| vkshim 5.0 contra r49 puro (tex / alu / vary) | 138 / 43,4 / 2,6 contra 141 / 43,8 / 2,6 | sem custo | — |
+| textura, aniso 16x (app) | 113,6 | — | referência |
+| `aniso=8` / `aniso=4` | 31,9 / 13,6 | 3,6x / **8,4x** | 26,7 / 23,8 dB (perde nitidez em superfícies inclinadas) |
+| `mip=near` | 53,1 | 2,1x | **37,3 dB** |
+| `lodbias=0.5` | 74,7 | 1,5x | 30,9 dB |
+| `fp16=1` (alu / tex / vary) | 41,5 / 111,3 / 3,2 | +5% / +1% / −13% | > 50 dB |
+
+**Num jogo real (BT3/Dragon Rage, 1x, luta):** `aniso=4 mip=near` não mudou nada (22,9 contra
+23,0 fps): em 1x o jogo é limitado pela CPU (GPU em 75%, sem espera pela GPU). O perfil turbo do
+Game Mode deu +11% (25,6 fps, p95 55,6 contra 60,5 ms, +4,5 °C). Prender o motor nos núcleos
+grandes não mudou nada (o escalonador já faz isso). Os ajustes de GPU valem para jogos limitados
+pela GPU (ports de PC, ou BT3 em 2x/3x).
+
 ## v5.0 — 2026-11-27
 
 Junta o trabalho das versões internas 4.8 a 4.9.4 (não publicadas separadamente). O foco é

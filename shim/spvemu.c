@@ -1513,3 +1513,116 @@ fail:
     *count = 0;
     return NULL;
 }
+
+/* ------------------------------------------------------------------ FP16 (v5.7, opcional)
+ * Só em módulos com entry points de fragment. Decora RelaxedPrecision (mediump: a Bifrost faz FP16
+ * com o dobro da vazão) nos resultados float de contas, loads, amostras de textura e nos varyings
+ * de entrada. Fica em FP32 (não decorado) tudo o que alimenta, mesmo indiretamente, operandos de
+ * imagem que não são a imagem em si (coordenadas, dref, lod, gradientes, offsets) e o gl_FragDepth:
+ * coordenada em FP16 faz textura grande tremer. */
+static int fp_result_op(uint32_t op) {
+    switch (op) {
+    case 127: case 129: case 131: case 133: case 136: case 140: case 141: case 142: case 143: case 144: case 145:
+    case 146: case 147: case 148: case 12: case 79: case 80: case 81: case 82: case 169: case 245: case 61:
+    case 111: case 112: case 115:
+        return 1;
+    }
+    return (op >= 87 && op <= 98);
+}
+
+uint32_t *spvemu_fp16(const uint32_t *w, size_t nw, size_t *out_nw, int *count) {
+    *count = 0;
+    Ed e;
+    oom = 0;
+    if (ed_init(&e, w, nw, NULL)) return NULL;
+    uint32_t B = e.bound0;
+    uint8_t *isf = calloc(B, 1), *keep = calloc(B, 1), *relaxed = calloc(B, 1);
+    uint32_t *defi = calloc(B, 4), *stk = malloc(B * 4 + 16);
+    uint8_t *var_keep = calloc(B, 1);
+    uint32_t *base = calloc(B, 4);   /* ponteiro -> variável de origem */
+    if (!isf || !keep || !relaxed || !defi || !stk || !var_keep || !base) goto fail;
+    for (uint32_t i = 0; i < e.i_func; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]);
+        if (op == 15 && x[1] != 4) goto fail;                       /* só fragment */
+        if (op == 22 && x[2] == 32 && x[1] < B) isf[x[1]] = 1;      /* float32 */
+        if ((op == 23 || op == 24) && x[1] < B && x[2] < B && isf[x[2]]) isf[x[1]] = 1;   /* vetor/matriz de float32 */
+        if (op == 71 && WC(x[0]) >= 3 && x[2] == 0 && x[1] < B) relaxed[x[1]] = 1;          /* já RelaxedPrecision */
+        if (op == 59 && x[2] < B) base[x[2]] = x[2];
+    }
+    for (uint32_t i = e.i_func; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (wc >= 3 && x[2] < B && (fp_result_op(op) || op == 59 || op == 65 || op == 66 || op == 86 || op == 100 || op == 124 || op == 207 || op == 208 || op == 209)) defi[x[2]] = i;
+        if (op == 59 && x[2] < B) base[x[2]] = x[2];
+        if ((op == 65 || op == 66) && wc >= 4 && x[2] < B && x[3] < B) base[x[2]] = base[x[3]];
+    }
+    /* sementes: operandos de imagem que não são a imagem; valor gravado no gl_FragDepth */
+    uint32_t sp = 0;
+#define PUSH(id) do { uint32_t _i = (id); if (_i < B && !keep[_i]) { keep[_i] = 1; stk[sp++] = _i; } } while (0)
+    for (uint32_t i = e.i_func; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if ((op >= 87 && op <= 99) || op == 105) {
+            uint32_t first = op == 99 ? 2 : 4;                       /* depois do sampled image */
+            uint32_t mpos = img_mask_pos(op);
+            for (uint32_t q = first; q < wc; q++) {
+                if (mpos && q == mpos) continue;                     /* máscara (literal) */
+                if (op == 99 && q == 3) continue;                    /* texel gravado: pode ser FP16 */
+                PUSH(x[q]);
+            }
+        }
+        if (op == 62 && wc >= 3 && x[1] < B && var_builtin(&e, base[x[1]]) == 22) PUSH(x[2]);
+    }
+    /* fatia para trás: operandos das instruções que definem os ids marcados; loads de variáveis
+     * marcam a variável e então todos os valores gravados nela */
+    while (sp) {
+        uint32_t id = stk[--sp];
+        if (id >= B || !defi[id]) continue;
+        const uint32_t *x = I(&e, defi[id]); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (op == 61 && wc >= 4) {
+            uint32_t v = x[3] < B ? base[x[3]] : 0;
+            if (v && !var_keep[v]) {
+                var_keep[v] = 1;
+                for (uint32_t i = e.i_func; i < e.ni; i++) {
+                    const uint32_t *y = I(&e, i);
+                    if (OP(y[0]) == 62 && WC(y[0]) >= 3 && y[1] < B && base[y[1]] == v) PUSH(y[2]);
+                }
+            }
+            PUSH(x[3]);
+            continue;
+        }
+        uint32_t from = 3;
+        if (op == 12) from = 5;                                      /* ExtInst: set, instrução */
+        for (uint32_t q = from; q < wc; q++) {
+            if ((op == 79 && q >= 5) || (op == 81 && q >= 4) || (op == 82 && q >= 5)) break;   /* literais */
+            PUSH(x[q]);
+        }
+    }
+#undef PUSH
+    /* decorações */
+    Buf *dp = &e.pre[e.i_annot_end];
+    int n = 0;
+    for (uint32_t i = e.i_func; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (!fp_result_op(op) || wc < 3 || x[1] >= B || x[2] >= B || !isf[x[1]] || keep[x[2]] || relaxed[x[2]]) continue;
+        if (op == 61 && x[3] < B && var_keep[base[x[3]]]) continue;
+        EMIT(dp, 71, x[2], 0); relaxed[x[2]] = 1; n++;
+    }
+    /* varyings de entrada (float) que não alimentam coordenadas */
+    const uint32_t *ep = I(&e, e.ep_i);
+    for (uint32_t k = e.ep_iface; k < WC(ep[0]); k++) {
+        const uint32_t *v = defw(&e, ep[k]);
+        if (!v || OP(v[0]) != 59 || v[3] != SC_INPUT || var_builtin(&e, ep[k]) >= 0 || var_keep[ep[k]] || relaxed[ep[k]]) continue;
+        uint32_t t = ptr_pointee(&e, v[1]);
+        if (t >= B || !isf[t]) continue;
+        EMIT(dp, 71, ep[k], 0); n++;
+    }
+    if (!n || oom) goto fail;
+    uint32_t *out = ed_build(&e, out_nw);
+    *count = n;
+    free(isf); free(keep); free(relaxed); free(defi); free(stk); free(var_keep); free(base);
+    ed_free(&e);
+    return out;
+fail:
+    free(isf); free(keep); free(relaxed); free(defi); free(stk); free(var_keep); free(base);
+    ed_free(&e);
+    return NULL;
+}

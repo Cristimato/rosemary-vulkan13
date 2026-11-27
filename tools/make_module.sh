@@ -1,5 +1,5 @@
 #!/bin/sh
-# Gera o zip instalável (KernelSU/Magisk) do módulo vk49_g76 (vkshim v5.0).
+# Gera o zip instalável (KernelSU/Magisk) do módulo vk49_g76 (vkshim v5.7).
 # Uso: tools/make_module.sh <Mali-r49p1-MT6768-v0.1.0.zip>
 # Saída: out/vk49_g76-<versão>-KSU.zip
 set -e

@@ -88,5 +88,7 @@ Com isso dá para separar **GPU-bound × CPU-bound × stutter de shader × throt
 2. ✅ **v4.9:** HUD (P0.2), config por pacote (U2), sepolicy/chmod do ged no módulo.
 3. ✅ **v4.9.2–4.9.4:** robustness2, push descriptor, descriptor indexing completo, draw_indirect_count,
    depth_clip_enable/control, multi draw, memory budget. **Lançado como v5.0 (2026-11-27).**
-4. **v5.7 (desempenho):** P1.1 limitador, P1.4 samplers, P1.3 fp16 experimental e P1.2 escala (se a
-   prova de conceito passar), perfis U4, integração com o Game Mode, matriz Q1.
+4. ✅ **v5.7 (2026-11-27):** P1.1 limitador (`fps=`), P1.4 samplers (`aniso=`, `mip=`, `lodbias=`),
+   P1.3 fp16 experimental (ganho pequeno medido), turbo no Game Mode (P3), benchmark p57.
+5. **Depois da v5.7:** P1.2 escala de resolução (prova de conceito), perfis prontos U4, P2 (banda:
+   attachments transitórios, AFBC), matriz de jogos Q1 com um port limitado pela GPU.

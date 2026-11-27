@@ -50,6 +50,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include "hud.h"
 #include "compat.h"
@@ -64,7 +65,7 @@ static long long mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONI
 #include "clipcull.h"
 #include "spvemu.h"
 
-#define VKSHIM_VERSION "5.0"
+#define VKSHIM_VERSION "5.7"
 #ifndef BCN_DEFAULT
 #define BCN_DEFAULT 0
 #endif
@@ -111,6 +112,9 @@ static int spv_on = 1, pcache_on = 1, dbg, bcn_on = BCN_DEFAULT, bcn_forced;
 static int clip_on = 1, clamp_on = 2, drawid_on = 1, errata_on = 1, nonsolid_on = 1, gs_enabled;
 static char pkg[128];
 static int wf_on = 1, wf_iters = 16;
+/* v5.7: samplers mais baratos (por jogo). aniso: -1 = do app, 0/1 = sem anisotrópico, N = teto */
+static int smp_aniso = -1, smp_mipnear, fp16_on, n_fp16, fps_cap;
+static float smp_lodbias;
 
 static int prop(const char *name, char *out) {
     out[0] = 0;
@@ -153,6 +157,12 @@ static int set_key(const char *k, const char *v) {
     if (!strcmp(k, "fake")) { set_fake(v); return 1; }
     if (!strcmp(k, "hud")) { hud_on = on; return 1; }
     if (!strcmp(k, "waterfall")) { if (off) wf_on = 0; else if (on) wf_on = 1; return 1; }
+    if (!strcmp(k, "aniso")) { smp_aniso = atoi(v); if (smp_aniso < 0) smp_aniso = -1; return 1; }
+    if (!strcmp(k, "lodbias")) { smp_lodbias = (float)atof(v); return 1; }
+    if (!strcmp(k, "mip")) { smp_mipnear = !strcmp(v, "near"); return 1; }
+    if (!strcmp(k, "fp16")) { fp16_on = on; return 1; }
+    if (!strcmp(k, "turbo")) return 1;      /* lido pelo Game Mode (piso de CPU no máximo), não pelo vkshim */
+    if (!strcmp(k, "fps")) { fps_cap = atoi(v); if (fps_cap < 0 || fps_cap > 240) fps_cap = 0; return 1; }
     return 0;
 }
 static void load_conf_file(void) {
@@ -186,7 +196,8 @@ static void load_config(void) {
     if (f) { if (!fread(pkg, 1, sizeof pkg - 1, f)) pkg[0] = 0; fclose(f); }
     char *c = strchr(pkg, ':'); if (c) *c = 0;
     load_conf_file();
-    static const char *keys[] = { "spv", "pcache", "clip", "clamp", "drawid", "errata", "nonsolid", "bcn", "fake", "hud", "waterfall" };
+    static const char *keys[] = { "spv", "pcache", "clip", "clamp", "drawid", "errata", "nonsolid", "bcn", "fake", "hud", "waterfall",
+                                  "aniso", "lodbias", "mip", "fp16", "fps" };
     char v[PROP_VALUE_MAX], name[64];
     if (prop("debug.vkshim", v) > 0) set_key("debug", v);
     for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) {
@@ -399,7 +410,7 @@ static unsigned spv_scan(const uint32_t *in, size_t nw) {
 
 /* processamento de um módulo: bindless -> (clip/cull fora) -> passes Mali */
 typedef struct {
-    uint32_t *rt, *cc, *fx, *wf;     /* buffers alocados (liberar com spv_free) */
+    uint32_t *rt, *cc, *fx, *wf, *fp; /* buffers alocados (liberar com spv_free) */
     const uint32_t *pre; size_t pre_nw;    /* antes do clipcull (fonte das variantes com clip) */
     const uint32_t *base; size_t base_nw;  /* sem os passes Mali (fallback) */
     const uint32_t *fin; size_t fin_nw;    /* o que vai para o driver */
@@ -429,12 +440,14 @@ static void spv_process(Spv *s, const uint32_t *code, size_t nw) {
     if ((s->rt = spv_patch_rt(cur, n, &t))) { cur = s->rt; n = t; }
     s->pre = cur; s->pre_nw = n;
     if (!realf.shaderClipDistance && (s->cc = clipcull_lower(cur, n, &t))) { cur = s->cc; n = t; __sync_fetch_and_add(&n_clip, 1); }
+    /* v5.7: FP16 opcional nos fragment shaders */
+    if (fp16_on) { int cnt = 0; if ((s->fp = spvemu_fp16(cur, n, &t, &cnt))) { cur = s->fp; n = t; __sync_fetch_and_add(&n_fp16, 1); } }
     s->base = cur; s->base_nw = n;
     spv_passes(cur, n, &s->fx, &t);
     if (s->fx) { cur = s->fx; n = t; }
     s->fin = cur; s->fin_nw = n;
 }
-static void spv_free(Spv *s) { free(s->rt); free(s->cc); free(s->fx); free(s->wf); memset(s, 0, sizeof *s); }
+static void spv_free(Spv *s) { free(s->rt); free(s->cc); free(s->fx); free(s->wf); free(s->fp); memset(s, 0, sizeof *s); }
 
 /* ---- SPIR-V guardado por módulo (para as variantes na criação do pipeline) ---- */
 typedef struct {
@@ -1790,6 +1803,21 @@ static VKAPI_ATTR void VKAPI_CALL my_cdiic(VkCommandBuffer cb, VkBuffer b, VkDev
     draw_count(cb, b, off, cbuf, coff, maxn, stride, 1);
 }
 
+/* ---- samplers (v5.7) ---- */
+static PFN_vkCreateSampler real_csmp;
+static int n_smp_mod;
+static VKAPI_ATTR VkResult VKAPI_CALL my_csmp(VkDevice d, const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *a, VkSampler *out) {
+    VkSamplerCreateInfo c = *ci;
+    if (smp_aniso >= 0 && c.anisotropyEnable) {
+        if (smp_aniso <= 1) c.anisotropyEnable = VK_FALSE;
+        else if (c.maxAnisotropy > (float)smp_aniso) c.maxAnisotropy = (float)smp_aniso;
+    }
+    if (smp_lodbias != 0.0f) c.mipLodBias += smp_lodbias;
+    if (smp_mipnear && c.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR) c.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    if (memcmp(&c, ci, sizeof c)) __sync_fetch_and_add(&n_smp_mod, 1);
+    return real_csmp(d, &c, a, out);
+}
+
 /* ---- HUD (v4.9) ---- */
 static VKAPI_ATTR VkResult VKAPI_CALL my_qs(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) { return hud_submit(q, n, s, f, real_qs); }
 static VKAPI_ATTR VkResult VKAPI_CALL my_qs2(VkQueue q, uint32_t n, const VkSubmitInfo2 *s, VkFence f) { return hud_submit2(q, n, s, f, real_qs2); }
@@ -1802,9 +1830,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_wff(VkDevice d, uint32_t n, const VkFen
 static VKAPI_ATTR VkResult VKAPI_CALL my_wsem(VkDevice d, const VkSemaphoreWaitInfo *i, uint64_t to) { VkResult r; TIMED(real_wsem(d, i, to)); return r; }
 static VKAPI_ATTR VkResult VKAPI_CALL my_qwi(VkQueue q) { VkResult r; TIMED(real_qwi(q)); return r; }
 static VKAPI_ATTR VkResult VKAPI_CALL my_dwi(VkDevice d) { VkResult r; TIMED(real_dwi(d)); return r; }
+/* limitador de FPS (v5.7): cada apresentação sai num horário fixo (relógio absoluto), então o
+ * intervalo entre quadros fica constante. Atraso de mais de um quadro reinicia o relógio. */
+static long long fps_next;
+static void fps_pace(void) {
+    long long period = 1000000000LL / fps_cap, now = mono_ns();
+    if (!fps_next || now - fps_next > period) { fps_next = now + period; return; }
+    if (now < fps_next) {
+        struct timespec ts = { (time_t)(fps_next / 1000000000LL), (long)(fps_next % 1000000000LL) };
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+    }
+    fps_next += period;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL my_sria(VkQueue q, uint32_t n, const VkSemaphore *w, VkImage img, int *fd) {
+    if (fps_cap) fps_pace();
     VkResult r = real_sria(q, n, w, img, fd);
-    hud_present();
+    if (hud_on) hud_present();
     return r;
 }
 
@@ -1843,6 +1884,8 @@ static PFN_vkVoidFunction hook(const char *n, PFN_vkVoidFunction r) {
     HOOK("vkCmdBindPipeline", real_cbp, my_cbp)
     HOOK("vkCmdSetCullMode", real_scm, my_scm)
     HOOK("vkCmdSetCullModeEXT", real_scm, my_scm)
+    if (smp_aniso >= 0 || smp_lodbias != 0.0f || smp_mipnear) { HOOK("vkCreateSampler", real_csmp, my_csmp) }
+    if (fps_cap && !hud_on) { HOOK("vkQueueSignalReleaseImageANDROID", real_sria, my_sria) }
     if (hud_on) {
         HOOK("vkQueueSubmit", real_qs, my_qs)
         HOOK("vkQueueSubmit2", real_qs2, my_qs2)
@@ -1997,8 +2040,9 @@ static int my_open(const hw_module_t *mod, const char *id, hw_device_t **out) {
     my_dev.GetInstanceProcAddr = my_gipa;
     my_dev.CreateInstance = my_ci;
     *out = &my_dev.common;
-    LOGI("vkshim v%s sobre %s | fake=0x%x clip=%d clamp=%d drawid=%d wire=%d errata=%d spv=%d pcache=%d bcn=%d hud=%d debug=%d | %s%s%s",
-         VKSHIM_VERSION, hal, fake, clip_on, clamp_on, drawid_on, nonsolid_on, errata_on, spv_on, pcache_on, bcn_on, hud_on, dbg, pkg,
+    LOGI("vkshim v%s sobre %s | fake=0x%x clip=%d clamp=%d drawid=%d wire=%d errata=%d spv=%d pcache=%d bcn=%d hud=%d debug=%d | aniso=%d lodbias=%.2f mip=%s fp16=%d fps=%d | %s%s%s",
+         VKSHIM_VERSION, hal, fake, clip_on, clamp_on, drawid_on, nonsolid_on, errata_on, spv_on, pcache_on, bcn_on, hud_on, dbg,
+         smp_aniso, smp_lodbias, smp_mipnear ? "near" : "app", fp16_on, fps_cap, pkg,
          conf_used[0] ? " | conf " : "", conf_used);
     return 0;
 }

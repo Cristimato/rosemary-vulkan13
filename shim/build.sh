@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compila o vkshim v5.0 (HAL wrapper Vulkan + passes SPIR-V Mali) para arm64 Android.
+# Compila o vkshim v5.7 (HAL wrapper Vulkan + passes SPIR-V Mali) para arm64 Android.
 # Uso: shim/build.sh [saida] [module|portable]
 #   module   (padrão): HAL do módulo; abre /vendor/lib64/hw/vulkan.pixelbc.so e vulkan.r49.so
 #   portable: pacote importável; procura vulkan.pixelbc.so / vulkan.r49.so na pasta do pacote
@@ -27,4 +27,4 @@ clang++ -shared -o "$OUT" "$O/shim.o" "$O/clipcull.o" "$O/spvemu.o" "$O/hud.o" "
 rm -rf "$O"
 llvm-strip --strip-unneeded "$OUT"
 patchelf --remove-rpath "$OUT"     # o RUNPATH do Termux não existe no namespace sphal
-echo "vkshim v5.0 ($MODE) -> $OUT"
+echo "vkshim v5.7 ($MODE) -> $OUT"

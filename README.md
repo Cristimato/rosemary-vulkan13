@@ -2,14 +2,17 @@
 
 **Vulkan 1.3 na Mali-G76 do POCO M5s / Redmi Note 10S (MT6785, "rosemary"), sem trocar o kernel.**
 
-> **Versão atual: v5.0 (2026-11-27)** — compatibilidade quase completa do Vulkan 1.3 para jogos e
-> camadas de tradução: `VK_EXT_robustness2`, push descriptors, **descriptor indexing completo**
-> (índice não uniforme por waterfall), `draw_indirect_count`, depthClamp exato, `depth_clip_enable`/
-> `_control`, multi draw, orçamento de memória, além de HUD de medição e config por jogo.
-> Veja o [CHANGELOG](CHANGELOG.md). A fase de desempenho fica para a v5.7
-> ([docs/ROADMAP-V5.md](docs/ROADMAP-V5.md)).
+> **Versão atual: v5.7 (2026-11-27)** — primeira versão de desempenho, tudo por jogo no
+> `vkshim.conf`: limitador de FPS com ritmo estável, samplers mais baratos (no benchmark, `aniso=4`
+> deixa a carga de textura 8,4x mais rápida e `mip=near` 2,1x com qualidade quase igual), FP16
+> experimental e o perfil turbo do Game Mode. Medições reais, inclusive o que não ajudou, no
+> [CHANGELOG](CHANGELOG.md).
+>
+> **v5.0:** compatibilidade quase completa do Vulkan 1.3 (robustness2, push descriptors,
+> descriptor indexing completo, `draw_indirect_count`, depthClamp exato, `depth_clip_enable`/
+> `_control`, multi draw, orçamento de memória), HUD e config por jogo.
 
-| | Stock | v2.0 | v4.7 | **v5.0** |
+| | Stock | v2.0 | v4.7 | **v5.0 / v5.7** |
 |---|---|---|---|---|
 | Driver / API Vulkan | r32p1 / 1.1.177 | r49p1 / 1.3.278 | r49p1 / 1.3.278 | r49p1 / **1.3.278** |
 | Shaders bindless (`runtimeDescriptorArray`) | ❌ pipeline falha | ✅ convertidos | ✅ convertidos | ✅ convertidos |
@@ -25,6 +28,7 @@
 | Erratas do compilador e do driver Mali | — | — | ✅ | ✅ |
 | Texturas BC1–BC7 (PixelBC) | ❌ | ❌ | ✅ | ✅ (sai sozinho em jogo sem BC) |
 | HUD de medição e config por jogo | — | — | — | ✅ |
+| Limitador de FPS, samplers por jogo, FP16 (v5.7) | — | — | — | ✅ (desligados por padrão) |
 | GLES / interface / kernel | r32p1 / stock | sem mudança | sem mudança | sem mudança |
 
 ---
@@ -56,7 +60,7 @@ Cada emulação pode ser desligada (veja [Ajustes](#ajustes)).
 app/jogo ──► /system/lib64/libvulkan.so  (loader Android)
                │
                ▼
-          hw/vulkan.mt6785.so   ← vkshim v5.0: bindless, erratas Mali/driver, recursos
+          hw/vulkan.mt6785.so   ← vkshim v5.7: bindless, erratas Mali/driver, recursos
                │                  emulados, cache de pipelines
                ▼
           hw/vulkan.pixelbc.so  ← PixelBC: texturas BC1–BC7 decodificadas na GPU
@@ -101,7 +105,7 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md) e
 **Requisitos:** POCO M5s / Redmi Note 10S (MT6785) com MIUI 14 / Android 12 (vendor
 `V14.0.17.0.TFFMIXM`), root KernelSU/SukiSU ou Magisk, kernel stock (kbase r32p1).
 
-1. Baixe **`vk49_g76-v5.0-KSU.zip`** na [Release mais recente](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root. Substitui a v4.x/v2 (mesmo id de módulo).
+1. Baixe **`vk49_g76-v5.7-KSU.zip`** na [Release mais recente](../../releases/latest) (os "Source code" são gerados automaticamente pelo GitHub e não são o módulo) e instale pelo gerenciador de root. Substitui a v5.0/v4.x/v2 (mesmo id de módulo).
 2. Reinicie.
 3. **KernelSU/SukiSU:** em cada jogo que vai usar o driver, abra *App Profile* e **desligue
    "Umount modules"**. Sem isso, o namespace do app desmonta o módulo e o jogo volta ao r32p1.
@@ -114,6 +118,13 @@ Detalhes, offsets e motivos: [docs/COMO-FUNCIONA.md](docs/COMO-FUNCIONA.md) e
 **Desinstalar:** remova o módulo no gerenciador e reinicie (ou `rm -rf /data/adb/modules/vk49_g76`).
 
 ## Validação
+
+### v5.7
+
+`tools/probe/p57` (benchmark de GPU, 1280x720, mediana de 40 quadros; `p57 cmp` mede PSNR):
+o vkshim não custa nada sobre o r49 puro; na carga de textura com aniso 16x, `aniso=4` = 8,4x mais
+rápido, `mip=near` = 2,1x (37 dB). Tabela completa e o teste no BT3 no [CHANGELOG](CHANGELOG.md).
+c92 22 OK / 1 limite e e47 23/23 seguem iguais à v5.0.
 
 ### v5.0
 
@@ -203,6 +214,16 @@ su -c vkshim-conf com.exemplo.jogo show
 | `spv` / `pcache` | `1` | `0` desliga os passes Mali / o cache de pipelines |
 | `bcn` | automático | `1`/`0` força o PixelBC (sem a chave: sai depois de 3 sessões sem textura BC) |
 | `hud` | `0` | `1` grava `Android/data/<pacote>/vkshim_hud.csv` (fps, quadro, espera pela GPU, draws, MHz, °C) |
+| `fps` | `0` | v5.7: limita a N quadros por segundo com intervalo constante (ex.: `30`) |
+| `aniso` | do app | v5.7: teto da filtragem anisotrópica (`4`, `2`; `0` desliga). O mais caro na Mali |
+| `mip` | do app | v5.7: `near` troca trilinear por bilinear (quase igual na imagem) |
+| `lodbias` | `0` | v5.7: soma ao LOD (`0.5` = texturas um pouco mais borradas e mais leves) |
+| `fp16` | `0` | v5.7, experimental: FP16 nos fragment shaders (ganho pequeno medido; teste por jogo) |
+| `turbo` | `0` | lido pelo Game Mode do rosemary (piso de CPU no máximo), não pelo vkshim |
+
+**Qual ajuste usar:** veja no HUD se o jogo espera pela GPU (`espera_ms` alta, `gpu_uso_pct` perto
+de 100%). Se espera, `aniso`/`mip`/`lodbias` ajudam. Se não espera e o FPS é baixo, o limite é a
+CPU: nesse caso só o turbo ajuda (no BT3 em 1x: +11%), e o `fps=30` deixa o ritmo estável.
 
 `su -c vkshim-hud <pacote>` mostra o HUD ao vivo; `vkshim-hud <pacote> resumo` dá as médias.
 
@@ -223,7 +244,7 @@ layouts, pools e alocações. Veja [docs/SOLUCAO-DE-PROBLEMAS.md](docs/SOLUCAO-D
 ```sh
 # precisa: clang/clang++, cmake, ninja, git, glslangValidator, headers Vulkan, patchelf, python3, zip
 tools/build_deps.sh                                  # SPIRV-Tools (fork) + PixelBC, commits fixos
-tools/make_module.sh Mali-r49p1-MT6768-v0.1.0.zip    # -> out/vk49_g76-v5.0-KSU.zip
+tools/make_module.sh Mali-r49p1-MT6768-v0.1.0.zip    # -> out/vk49_g76-v5.7-KSU.zip
 tests/run.sh                                         # testes offline dos passes SPIR-V
 ```
 
@@ -236,7 +257,7 @@ os binários gerados são idênticos aos da release.
 
 ```
 module/            template do módulo (module.prop, customize.sh, service.sh, sepolicy.rule, bin/)
-shim/              vkshim v5.0: shim.c, spvemu.c (emulações + waterfall), compat.c (extensões),
+shim/              vkshim v5.7: shim.c, spvemu.c (emulações + waterfall), compat.c (extensões),
                    hud.c (medição), clipcull.c, spvfix.cpp (passes Mali)
 patches/           patch do PixelBC (caminho do backend)
 tests/             shaders de teste + run.sh (validação offline)
@@ -244,7 +265,7 @@ tools/
   build_deps.sh    baixa e compila SPIRV-Tools (fork leegao) e PixelBC em commits fixos
   make_module.sh   monta o zip instalável
   patch_blob.py    patches binários do blob r49p1 (com verificação)
-  probe/           sysvk, shimvk, fullvk, v4test, e47 (render), c92 (compatibilidade da v5.0)
+  probe/           sysvk, shimvk, fullvk, v4test, e47 (render), c92 (compatibilidade), p57 (benchmark)
   vkshim-conf/-hud config por jogo e HUD (também em module/system/bin)
 docs/              como funciona, pesquisa da v4, histórico, solução de problemas
 THIRD_PARTY.md     componentes de terceiros e licenças

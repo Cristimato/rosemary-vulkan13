@@ -56,3 +56,7 @@ uint32_t *spvemu_gs_poly(const uint32_t *w, size_t nw, const char *entry, int po
  * Devolve NULL se nada foi feito; *count = quantas operações foram convertidas. */
 int spvemu_waterfall_needed(const uint32_t *w, size_t nw);
 uint32_t *spvemu_waterfall(const uint32_t *w, size_t nw, int iters, size_t *out_nw, int *count);
+
+/* v5.7: RelaxedPrecision (FP16) nos fragment shaders, menos o que alimenta coordenadas de textura
+ * e gl_FragDepth. NULL = não é fragment ou nada a fazer; *count = quantas decorações. */
+uint32_t *spvemu_fp16(const uint32_t *w, size_t nw, size_t *out_nw, int *count);
