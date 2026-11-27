@@ -31,7 +31,8 @@
 //   debug.vkshim.fake     lista: depthclamp,nonsolid,clipdist,mdi,multivp,vsstores,descidx | all | none
 //                         (padrão: depthclamp,nonsolid,clipdist,mdi)
 //   debug.vkshim.clip     0 = planos de recorte ignorados como na v4 (padrão 1 = emulados)
-//   debug.vkshim.clamp    0 = depthClamp ignorado como na v4 (padrão 1 = emulado)
+//   debug.vkshim.clamp    0 = depthClamp ignorado como na v4; 1 = z preso por vértice (v4.7);
+//                         2 = exato por pixel com gl_FragDepth (padrão desde a v4.8)
 //   debug.vkshim.drawid   0 = gl_DrawID fica 0 no multiDrawIndirect como na v4 (padrão 1)
 //   debug.vkshim.nonsolid 0 = LINE/POINT viram FILL como na v4 (padrão 1 = wireframe por geometry shader)
 //   debug.vkshim.errata   0 = desliga as correções MK-16/MK-07/MK-11/MK-06 (padrão 1)
@@ -50,13 +51,20 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "hud.h"
+#include "compat.h"
+extern PFN_vkGetInstanceProcAddr compat_gipa;
+extern VkInstance compat_inst;
+void compat_layout(VkPipelineLayout pl, const VkPipelineLayoutCreateInfo *ci);
+void compat_layout_destroy(VkPipelineLayout pl);
+static long long mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include "spvfix.h"
 #include "clipcull.h"
 #include "spvemu.h"
 
-#define VKSHIM_VERSION "4.7"
+#define VKSHIM_VERSION "5.0"
 #ifndef BCN_DEFAULT
 #define BCN_DEFAULT 0
 #endif
@@ -99,45 +107,92 @@ enum {
     F_MULTIVP = 1u << 4, F_VSSTORES = 1u << 5, F_DESCIDX = 1u << 6,
 };
 static unsigned fake = F_DEPTHCLAMP | F_NONSOLID | F_CLIPDIST | F_MDI;
-static int spv_on = 1, pcache_on = 1, dbg, bcn_on = BCN_DEFAULT;
-static int clip_on = 1, clamp_on = 1, drawid_on = 1, errata_on = 1, nonsolid_on = 1, gs_enabled;
+static int spv_on = 1, pcache_on = 1, dbg, bcn_on = BCN_DEFAULT, bcn_forced;
+static int clip_on = 1, clamp_on = 2, drawid_on = 1, errata_on = 1, nonsolid_on = 1, gs_enabled;
 static char pkg[128];
+static int wf_on = 1, wf_iters = 16;
 
 static int prop(const char *name, char *out) {
     out[0] = 0;
     return __system_property_get(name, out);
 }
-static int prop_off(const char *name) { char v[PROP_VALUE_MAX]; return prop(name, v) > 0 && v[0] == '0'; }
 
-static void load_config(void) {
-    char v[PROP_VALUE_MAX];
-    if (prop("debug.vkshim", v) > 0 && v[0] == '1') dbg = 1;
-    if (prop_off("debug.vkshim.spv")) spv_on = 0;
-    if (prop_off("debug.vkshim.pcache")) pcache_on = 0;
-    if (prop_off("debug.vkshim.clip")) clip_on = 0;
-    if (prop_off("debug.vkshim.clamp")) clamp_on = 0;
-    if (prop_off("debug.vkshim.drawid")) drawid_on = 0;
-    if (prop_off("debug.vkshim.errata")) errata_on = 0;
-    if (prop_off("debug.vkshim.nonsolid")) nonsolid_on = 0;
-    if (prop("debug.vkshim.bcn", v) > 0) bcn_on = v[0] == '1';
-    if (prop("debug.vkshim.fake", v) > 0) {
-        static const struct { const char *n; unsigned b; } tab[] = {
-            {"depthclamp", F_DEPTHCLAMP}, {"nonsolid", F_NONSOLID}, {"clipdist", F_CLIPDIST},
-            {"mdi", F_MDI}, {"multivp", F_MULTIVP}, {"vsstores", F_VSSTORES}, {"descidx", F_DESCIDX},
-        };
-        if (!strcmp(v, "all")) fake = 0x7f;
-        else if (!strcmp(v, "none")) fake = 0;
-        else {
-            fake = 0;
-            char *save = NULL;
-            for (char *t = strtok_r(v, ",", &save); t; t = strtok_r(NULL, ",", &save))
-                for (unsigned i = 0; i < sizeof tab / sizeof *tab; i++)
-                    if (!strcmp(t, tab[i].n)) fake |= tab[i].b;
+/* ---- configuração (v4.9) ----
+ * Ordem: padrão -> arquivo do jogo -> props debug.vkshim.* (a prop sempre ganha).
+ * Arquivo: /storage/emulated/0/Android/data/<pkg>/vkshim.conf (o app lê a própria pasta externa
+ * sem permissão; dá para editar sem root) ou /data/user/0/<pkg>/files/vkshim.conf.
+ * Formato: chave=valor por linha, '#' comenta. Chaves: debug spv pcache clip clamp drawid errata
+ * nonsolid bcn fake hud (mesmos valores das props). */
+static char conf_used[300];
+static void set_fake(const char *v) {
+    static const struct { const char *n; unsigned b; } tab[] = {
+        {"depthclamp", F_DEPTHCLAMP}, {"nonsolid", F_NONSOLID}, {"clipdist", F_CLIPDIST},
+        {"mdi", F_MDI}, {"multivp", F_MULTIVP}, {"vsstores", F_VSSTORES}, {"descidx", F_DESCIDX},
+    };
+    if (!strcmp(v, "all")) { fake = 0x7f; return; }
+    if (!strcmp(v, "none")) { fake = 0; return; }
+    char buf[PROP_VALUE_MAX]; snprintf(buf, sizeof buf, "%s", v);
+    fake = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save))
+        for (unsigned i = 0; i < sizeof tab / sizeof *tab; i++)
+            if (!strcmp(t, tab[i].n)) fake |= tab[i].b;
+}
+/* aplica uma chave; devolve 0 se a chave não existe */
+static int set_key(const char *k, const char *v) {
+    int on = v[0] == '1', off = v[0] == '0';
+    if (!strcmp(k, "debug")) { dbg = on; return 1; }
+    if (!strcmp(k, "spv")) { if (off) spv_on = 0; else if (on) spv_on = 1; return 1; }
+    if (!strcmp(k, "pcache")) { if (off) pcache_on = 0; else if (on) pcache_on = 1; return 1; }
+    if (!strcmp(k, "clip")) { if (off) clip_on = 0; else if (on) clip_on = 1; return 1; }
+    if (!strcmp(k, "clamp")) { if (v[0] >= '0' && v[0] <= '2') clamp_on = v[0] - '0'; return 1; }
+    if (!strcmp(k, "drawid")) { if (off) drawid_on = 0; else if (on) drawid_on = 1; return 1; }
+    if (!strcmp(k, "errata")) { if (off) errata_on = 0; else if (on) errata_on = 1; return 1; }
+    if (!strcmp(k, "nonsolid")) { if (off) nonsolid_on = 0; else if (on) nonsolid_on = 1; return 1; }
+    if (!strcmp(k, "bcn")) { if (on || off) { bcn_on = on; bcn_forced = 1; } return 1; }
+    if (!strcmp(k, "fake")) { set_fake(v); return 1; }
+    if (!strcmp(k, "hud")) { hud_on = on; return 1; }
+    if (!strcmp(k, "waterfall")) { if (off) wf_on = 0; else if (on) wf_on = 1; return 1; }
+    return 0;
+}
+static void load_conf_file(void) {
+    if (!pkg[0] || strchr(pkg, '/')) return;
+    char p[2][300];
+    snprintf(p[0], sizeof p[0], "/storage/emulated/0/Android/data/%s/vkshim.conf", pkg);
+    snprintf(p[1], sizeof p[1], "/data/user/0/%s/files/vkshim.conf", pkg);
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(p[i], "r");
+        if (!f) continue;
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            char *h = strchr(line, '#'); if (h) *h = 0;
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            char *k = line, *v = eq + 1;
+            while (*k == ' ' || *k == '\t') k++;
+            for (char *e = k + strlen(k); e > k && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+            while (*v == ' ' || *v == '\t') v++;
+            for (char *e = v + strlen(v); e > v && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r'); ) *--e = 0;
+            if (*k && !set_key(k, v)) __android_log_print(ANDROID_LOG_WARN, "vkshim", "vkshim.conf: chave desconhecida '%s'", k);
         }
+        fclose(f);
+        snprintf(conf_used, sizeof conf_used, "%s", p[i]);
+        break;
     }
+}
+static void load_config(void) {
     FILE *f = fopen("/proc/self/cmdline", "r");
     if (f) { if (!fread(pkg, 1, sizeof pkg - 1, f)) pkg[0] = 0; fclose(f); }
     char *c = strchr(pkg, ':'); if (c) *c = 0;
+    load_conf_file();
+    static const char *keys[] = { "spv", "pcache", "clip", "clamp", "drawid", "errata", "nonsolid", "bcn", "fake", "hud", "waterfall" };
+    char v[PROP_VALUE_MAX], name[64];
+    if (prop("debug.vkshim", v) > 0) set_key("debug", v);
+    for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) {
+        snprintf(name, sizeof name, "debug.vkshim.%s", keys[i]);
+        if (prop(name, v) > 0 && v[0]) set_key(keys[i], v);
+    }
 }
 
 /* ---- ponteiros reais ---- */
@@ -145,6 +200,9 @@ static hwvulkan_device_t *real_dev;
 static hwvulkan_device_t my_dev;
 static PFN_vkGetInstanceProcAddr real_gipa;
 static PFN_vkGetDeviceProcAddr real_gdpa;
+typedef VkResult (VKAPI_PTR *PFN_SignalRelease)(VkQueue, uint32_t, const VkSemaphore *, VkImage, int *);
+static PFN_vkQueueSubmit real_qs; static PFN_vkQueueSubmit2 real_qs2;
+static PFN_vkGetDeviceQueue real_gdq; static PFN_vkGetDeviceQueue2 real_gdq2; static PFN_SignalRelease real_sria;
 static PFN_vkCreateInstance real_ci;
 static PFN_vkGetPhysicalDeviceFeatures real_gpdf;
 static PFN_vkGetPhysicalDeviceFeatures2 real_gpdf2;
@@ -172,6 +230,8 @@ static PFN_vkDestroyCommandPool real_dcp;
 static PFN_vkBeginCommandBuffer real_bcb;
 static PFN_vkCmdExecuteCommands real_cec;
 static PFN_vkCmdBindPipeline real_cbp;
+static PFN_vkGetBufferDeviceAddress real_gbda;
+static VkDevice g_dev;
 static PFN_vkCmdSetCullMode real_scm;
 static PFN_vkCmdPushConstants real_cpush;
 static PFN_vkCmdDraw real_cdraw;
@@ -200,8 +260,9 @@ static uint32_t max_push = 128, max_out_vec = 16;
 #define EMU_DRAWID ((fake & F_MDI) && drawid_on && !realf.multiDrawIndirect)
 
 /* ---- estatística ---- */
+static int n_wf;
 static int n_clip, n_rt_patch, n_spv_fix, n_spv_err, n_pipe_fail, n_pipe_total, n_pc_hits;
-static int n_emu_clip, n_emu_clamp, n_emu_drawid, n_emu_poly, n_emu_fail, n_fix_cull, n_fix_views, n_fix_stencil, n_quar;
+static int n_emu_clip, n_emu_clamp, n_emu_clampx, n_emu_drawid, n_emu_poly, n_emu_fail, n_fix_cull, n_fix_views, n_fix_stencil, n_quar;
 
 /* ======================================================================
  * Tabela de hash genérica (handle -> ponteiro)
@@ -249,7 +310,7 @@ static uint32_t *spv_patch_rt(const uint32_t *in, size_t nw, size_t *out_nw) {
     for (size_t i = 5; i < nw;) {
         uint32_t op = in[i] & 0xffff, wc = in[i] >> 16; if (!wc || i + wc > nw) return NULL;
         if (op == 29) has_rt = 1;
-        if (op == 17 && wc == 2 && (in[i+1] == 5301 || in[i+1] == 5302 || (in[i+1] >= 5306 && in[i+1] <= 5312))) has_rt = 1;
+        if (op == 17 && wc == 2 && (in[i+1] == 5301 || in[i+1] == 5302 || (in[i+1] >= 5304 && in[i+1] <= 5312))) has_rt = 1;
         i += wc;
     }
     if (!has_rt) return NULL;
@@ -278,7 +339,7 @@ static uint32_t *spv_patch_rt(const uint32_t *in, size_t nw, size_t *out_nw) {
     for (size_t i = 5; i < nw;) {
         uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
         const uint32_t *w = &in[i];
-        if (op == 17 && wc == 2 && (w[1] == 5301 || w[1] == 5302 || (w[1] >= 5306 && w[1] <= 5312))) { removed++; i += wc; continue; }
+        if (op == 17 && wc == 2 && (w[1] == 5301 || w[1] == 5302 || (w[1] >= 5304 && w[1] <= 5312))) { removed++; i += wc; continue; }
         if (op == 10) { const char *nm = (const char *)&w[1]; if (strstr(nm, "descriptor_indexing")) { removed++; i += wc; continue; } }
         if (op == 71 && wc >= 3 && w[2] == 5300) { removed++; i += wc; continue; } /* NonUniform */
         if (op == 29 && wc == 3 && w[2] < bound && kind[w[2]] && kind[w[2]] != 4) {
@@ -338,7 +399,7 @@ static unsigned spv_scan(const uint32_t *in, size_t nw) {
 
 /* processamento de um módulo: bindless -> (clip/cull fora) -> passes Mali */
 typedef struct {
-    uint32_t *rt, *cc, *fx;          /* buffers alocados (liberar com spv_free) */
+    uint32_t *rt, *cc, *fx, *wf;     /* buffers alocados (liberar com spv_free) */
     const uint32_t *pre; size_t pre_nw;    /* antes do clipcull (fonte das variantes com clip) */
     const uint32_t *base; size_t base_nw;  /* sem os passes Mali (fallback) */
     const uint32_t *fin; size_t fin_nw;    /* o que vai para o driver */
@@ -360,6 +421,11 @@ static void spv_passes(const uint32_t *in, size_t nw, uint32_t **out, size_t *ou
 static void spv_process(Spv *s, const uint32_t *code, size_t nw) {
     memset(s, 0, sizeof *s);
     const uint32_t *cur = code; size_t n = nw, t;
+    /* v4.9.3: índice NonUniform de imagens -> waterfall (antes de as decorações saírem) */
+    if (wf_on && spvemu_waterfall_needed(cur, n)) {
+        int cnt = 0;
+        if ((s->wf = spvemu_waterfall(cur, n, wf_iters, &t, &cnt))) { cur = s->wf; n = t; __sync_fetch_and_add(&n_wf, cnt); }
+    }
     if ((s->rt = spv_patch_rt(cur, n, &t))) { cur = s->rt; n = t; }
     s->pre = cur; s->pre_nw = n;
     if (!realf.shaderClipDistance && (s->cc = clipcull_lower(cur, n, &t))) { cur = s->cc; n = t; __sync_fetch_and_add(&n_clip, 1); }
@@ -368,7 +434,7 @@ static void spv_process(Spv *s, const uint32_t *code, size_t nw) {
     if (s->fx) { cur = s->fx; n = t; }
     s->fin = cur; s->fin_nw = n;
 }
-static void spv_free(Spv *s) { free(s->rt); free(s->cc); free(s->fx); memset(s, 0, sizeof *s); }
+static void spv_free(Spv *s) { free(s->rt); free(s->cc); free(s->fx); free(s->wf); memset(s, 0, sizeof *s); }
 
 /* ---- SPIR-V guardado por módulo (para as variantes na criação do pipeline) ---- */
 typedef struct {
@@ -437,6 +503,48 @@ static VKAPI_ATTR void VKAPI_CALL my_dsm(VkDevice d, VkShaderModule h, const VkA
 /* ======================================================================
  * 3. Cache de pipelines persistente
  * ====================================================================== */
+/* ---- PixelBC por jogo (v4.8) ----
+ * O PixelBC é uma camada da HAL: ou entra na abertura, ou não entra. Para não pagar o custo dele
+ * (~0,25 µs por vkCmdPushConstants) em jogos sem texturas BC, o vkshim anota por jogo, em
+ * /data/user/0/<pkg>/cache/vkshim_bc.txt, quantas sessões seguidas (de 60 s ou mais) não criaram
+ * nenhuma imagem BC. Com 3 ou mais, a próxima abertura segue sem o PixelBC. Se o jogo tentar criar
+ * uma imagem BC sem ele, a marca volta a zero e a sessão seguinte já abre com o PixelBC.
+ * debug.vkshim.bcn=0/1 força e ignora o arquivo. */
+#define BC_SESSOES 3
+static int bc_seen, bc_skipped, bc_prev_sessions, bc_written;
+static char bc_path[300];
+static time_t bc_t0;
+static int is_bc_format(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
+static void bc_write(int sessions, int seen) {
+    if (!bc_path[0]) return;
+    char tmp[320]; snprintf(tmp, sizeof tmp, "%s.tmp", bc_path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "sessoes_sem_bc=%d\nbc=%d\n", sessions, seen);
+    if (fclose(f) == 0) rename(tmp, bc_path); else unlink(tmp);
+}
+static void bc_load(void) {
+    if (!pkg[0] || strchr(pkg, '/')) return;
+    char dir[200]; snprintf(dir, sizeof dir, "/data/user/0/%s/cache", pkg);
+    if (access(dir, W_OK)) return;
+    snprintf(bc_path, sizeof bc_path, "%s/vkshim_bc.txt", dir);
+    bc_t0 = time(NULL);
+    FILE *f = fopen(bc_path, "r");
+    if (!f) return;
+    int n = 0, b = 0;
+    if (fscanf(f, "sessoes_sem_bc=%d\nbc=%d", &n, &b) >= 1 && n > 0) bc_prev_sessions = n;
+    fclose(f);
+}
+/* chamado pelo salvador periódico e no vkDestroyDevice */
+static void bc_tick(int final) {
+    if (!bc_path[0] || bc_written) return;
+    if (bc_seen) return;                                  /* já gravado no my_cimg */
+    if (!final && time(NULL) - bc_t0 < 60) return;
+    if (final && time(NULL) - bc_t0 < 60) return;         /* sessão curta não conta */
+    bc_written = 1;
+    if (!bc_skipped) bc_write(bc_prev_sessions + 1, 0);
+}
+
 typedef struct { VkDevice dev; VkPipelineCache pc; int dirty; uint8_t uuid[VK_UUID_SIZE]; uint32_t vendor, devid; } DevSt;
 static DevSt devs[4];
 static pthread_mutex_t pc_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -469,6 +577,7 @@ static void *pc_saver(void *arg) {
         pthread_mutex_lock(&pc_mu);
         for (int i = 0; i < 4; i++) pc_save_locked(&devs[i]);
         pthread_mutex_unlock(&pc_mu);
+        bc_tick(0);
     }
     return NULL;
 }
@@ -560,6 +669,7 @@ static VKAPI_ATTR void VKAPI_CALL my_gpdf2(VkPhysicalDevice pd, VkPhysicalDevice
     real_gpdf2(pd, f);
     fake_core(&f->features);
     fake_chain(f->pNext);
+    compat_features(pd, f->pNext);
 }
 
 static void fake_props(VkPhysicalDeviceProperties *p) {
@@ -569,27 +679,34 @@ static void fake_props(VkPhysicalDeviceProperties *p) {
         p->limits.maxClipDistances = 8; p->limits.maxCullDistances = 8; p->limits.maxCombinedClipAndCullDistances = 8;
     }
 }
+static PFN_vkGetPhysicalDeviceMemoryProperties2 real_gpdmp2;
+static VKAPI_ATTR void VKAPI_CALL my_gpdmp2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *p) {
+    real_gpdmp2(pd, p); compat_memprops(pd, p->pNext);
+}
 static VKAPI_ATTR void VKAPI_CALL my_gpdp(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
     real_gpdp(pd, p); fake_props(p);
 }
 static VKAPI_ATTR void VKAPI_CALL my_gpdp2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
-    real_gpdp2(pd, p); fake_props(&p->properties);
+    real_gpdp2(pd, p); fake_props(&p->properties); compat_props(pd, p->pNext);
 }
 
 /* extensão anunciada a mais quando descidx está ligado */
 static const VkExtensionProperties ext_descidx = { VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME, 2 };
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_edep(VkPhysicalDevice pd, const char *layer, uint32_t *n, VkExtensionProperties *p) {
-    if (layer || !(fake & F_DESCIDX)) return real_edep(pd, layer, n, p);
+    if (layer || (!(fake & F_DESCIDX) && !compat_on)) return real_edep(pd, layer, n, p);
     uint32_t rn = 0;
     VkResult r = real_edep(pd, NULL, &rn, NULL);
     if (r != VK_SUCCESS) return r;
-    VkExtensionProperties *tmp = calloc(rn + 1, sizeof *tmp);
+    VkExtensionProperties *tmp = calloc(rn + 32, sizeof *tmp);
     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
     real_edep(pd, NULL, &rn, tmp);
-    int have = 0;
-    for (uint32_t i = 0; i < rn; i++) if (!strcmp(tmp[i].extensionName, ext_descidx.extensionName)) have = 1;
-    if (!have) tmp[rn++] = ext_descidx;
+    if (fake & F_DESCIDX) {
+        int have = 0;
+        for (uint32_t i = 0; i < rn; i++) if (!strcmp(tmp[i].extensionName, ext_descidx.extensionName)) have = 1;
+        if (!have) tmp[rn++] = ext_descidx;
+    }
+    rn += compat_exts(&tmp[rn], 30, tmp, rn);
     if (!p) { *n = rn; free(tmp); return VK_SUCCESS; }
     uint32_t c = *n < rn ? *n : rn;
     memcpy(p, tmp, c * sizeof *p);
@@ -663,14 +780,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cd(VkPhysicalDevice pd, const VkDeviceC
             c2.enabledExtensionCount = k; c2.ppEnabledExtensionNames = ext;
         }
     }
-    VkResult r = real_cd(pd, &c2, a, out);
+    CompatDC *cst = NULL;
+    const VkDeviceCreateInfo *cdc = compat_device_begin(pd, &c2, &cst);
+    VkResult r = real_cd(pd, cdc, a, out);
     if (gsp) *gsp = VK_FALSE;
     if (r != VK_SUCCESS) gs_enabled = 0;
+    if (cst && r != VK_SUCCESS) { compat_device_done(cst, *out, r, NULL); cst = NULL; }
     for (int i = ns - 1; i >= 0; i--) *s[i].p = s[i].v;
     free(ext);
     if (ns) LOGI("vkCreateDevice: %d recursos emulados retirados da criação", ns);
     if (r == VK_SUCCESS) {
         if (!real_gdpa && g_inst) real_gdpa = (PFN_vkGetDeviceProcAddr)real_gipa(g_inst, "vkGetDeviceProcAddr");
+        if (hud_on && real_gdpa) hud_device(*out, pd, g_inst, real_gdpa, real_gipa);
+        compat_device_done(cst, *out, r, real_gdpa); cst = NULL;
         if (real_gdpa) {
             VkDevice d = *out;
 #define GET(var, name) if (!var) var = (void *)real_gdpa(d, name)
@@ -685,11 +807,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cd(VkPhysicalDevice pd, const VkDeviceC
             GET(real_div, "vkDestroyImageView");
             GET(real_cdi, "vkCmdDrawIndirect");
             GET(real_cdii, "vkCmdDrawIndexedIndirect");
+            GET(real_cbp, "vkCmdBindPipeline");
+            real_gbda = (PFN_vkGetBufferDeviceAddress)real_gdpa(d, "vkGetBufferDeviceAddress");
+            g_dev = d;
 #undef GET
             pc_setup(d, pd);
         }
         VkPhysicalDeviceProperties pr; real_gpdp(pd, &pr);
         max_push = pr.limits.maxPushConstantsSize;
+        if (real_gpdp2) {   /* waterfall: uma volta por thread do subgroup basta */
+            VkPhysicalDeviceSubgroupProperties sg = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+            VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sg };
+            real_gpdp2(pd, &p2);
+            if (sg.subgroupSize >= 4 && sg.subgroupSize <= 64) wf_iters = (int)sg.subgroupSize;
+        }
         max_out_vec = pr.limits.maxVertexOutputComponents / 4;
         if (pr.limits.maxFragmentInputComponents / 4 < max_out_vec) max_out_vec = pr.limits.maxFragmentInputComponents / 4;
     } else LOGE("vkCreateDevice falhou %d", r);
@@ -705,9 +836,12 @@ static VKAPI_ATTR void VKAPI_CALL my_dd(VkDevice d, const VkAllocationCallbacks 
     }
     pthread_mutex_unlock(&pc_mu);
     quar_flush(d, VK_NULL_HANDLE);
-    LOGI("stats: clip=%d rt_patch=%d spv_fix=%d spv_err=%d pipelines=%d falhas=%d pcache=%d | emu clip=%d clamp=%d drawid=%d wire=%d falhou=%d | erratas cull=%d views=%d stencil=%d quarentena=%d",
-         n_clip, n_rt_patch, n_spv_fix, n_spv_err, n_pipe_total, n_pipe_fail, n_pc_hits,
-         n_emu_clip, n_emu_clamp, n_emu_drawid, n_emu_poly, n_emu_fail, n_fix_cull, n_fix_views, n_fix_stencil, n_quar);
+    bc_tick(1);
+    hud_device_destroy(d);
+    compat_device_destroy(d);
+    LOGI("stats: waterfall=%d clip=%d rt_patch=%d spv_fix=%d spv_err=%d pipelines=%d falhas=%d pcache=%d | emu clip=%d clamp=%d(exato %d) drawid=%d wire=%d falhou=%d | erratas cull=%d views=%d stencil=%d quarentena=%d",
+         n_wf, n_clip, n_rt_patch, n_spv_fix, n_spv_err, n_pipe_total, n_pipe_fail, n_pc_hits,
+         n_emu_clip, n_emu_clamp, n_emu_clampx, n_emu_drawid, n_emu_poly, n_emu_fail, n_fix_cull, n_fix_views, n_fix_stencil, n_quar);
     real_dd(d, a);
 }
 
@@ -744,13 +878,19 @@ static void dump_fail(int idx, VkResult r, const VkGraphicsPipelineCreateInfo *c
 /* ======================================================================
  * 5. Pipeline layouts: slot de push constant para o gl_DrawID
  * ====================================================================== */
-typedef struct { uint32_t off, stages; } LInfo;
+typedef struct { uint32_t off, stages, off8; } LInfo;   /* off8: endereço do contador (0 = sem) */
 static HMap layouts = HMAP_INIT;
 
+static VkResult cpl_inner(VkDevice d, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineLayout *out);
 static VKAPI_ATTR VkResult VKAPI_CALL my_cpl(VkDevice d, const VkPipelineLayoutCreateInfo *ci,
                                               const VkAllocationCallbacks *a, VkPipelineLayout *out) {
-    if (!EMU_DRAWID) return real_cpl(d, ci, a, out);
-    /* 4 bytes depois de todos os ranges do app, no range que já tem o vertex shader (um range por
+    VkResult r = cpl_inner(d, ci, a, out);
+    if (r == VK_SUCCESS) compat_layout(*out, ci);
+    return r;
+}
+static VkResult cpl_inner(VkDevice d, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineLayout *out) {
+    if (!EMU_DRAWID && !compat_count_on) return real_cpl(d, ci, a, out);
+    /* 4 bytes (+ 8 alinhados para o endereço do contador do draw_indirect_count) depois de todos os ranges do app, no range que já tem o vertex shader (um range por
      * estágio) se ele é o último, ou num range novo só de vertex se nenhum range tem vertex */
     uint32_t end = 0, n = ci->pushConstantRangeCount;
     int vr = -1;
@@ -759,8 +899,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cpl(VkDevice d, const VkPipelineLayoutC
         if (r->offset + r->size > end) end = r->offset + r->size;
         if (r->stageFlags & VK_SHADER_STAGE_VERTEX_BIT) vr = (int)i;
     }
-    uint32_t off = (end + 3) & ~3u;
-    int ok = off + 4 <= max_push;
+    uint32_t off = (end + 3) & ~3u, off8 = 0, fim = off + 4;
+    if (compat_count_on) { off8 = (off + 4 + 7) & ~7u; fim = off8 + 8; }
+    int ok = fim <= max_push;
     if (ok && vr >= 0) {
         /* estender o range do VS não pode cobrir bytes de outro range */
         const VkPushConstantRange *v = &ci->pPushConstantRanges[vr];
@@ -774,20 +915,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cpl(VkDevice d, const VkPipelineLayoutC
     if (!rr) return real_cpl(d, ci, a, out);
     if (n) memcpy(rr, ci->pPushConstantRanges, n * sizeof *rr);
     uint32_t stages;
-    if (vr >= 0) { rr[vr].size = off + 4 - rr[vr].offset; stages = rr[vr].stageFlags; }
-    else { rr[n] = (VkPushConstantRange){ VK_SHADER_STAGE_VERTEX_BIT, off, 4 }; n++; stages = VK_SHADER_STAGE_VERTEX_BIT; }
+    if (vr >= 0) { rr[vr].size = fim - rr[vr].offset; stages = rr[vr].stageFlags; }
+    else { rr[n] = (VkPushConstantRange){ VK_SHADER_STAGE_VERTEX_BIT, off, fim - off }; n++; stages = VK_SHADER_STAGE_VERTEX_BIT; }
     VkPipelineLayoutCreateInfo c2 = *ci;
     c2.pushConstantRangeCount = n; c2.pPushConstantRanges = rr;
     VkResult r = real_cpl(d, &c2, a, out);
     free(rr);
     if (r == VK_SUCCESS) {
         LInfo *li = malloc(sizeof *li);
-        if (li) { li->off = off; li->stages = stages; free(hput(&layouts, HK(*out), li)); }
+        if (li) { li->off = off; li->stages = stages; li->off8 = off8; free(hput(&layouts, HK(*out), li)); }
     }
     return r;
 }
 static VKAPI_ATTR void VKAPI_CALL my_dpl(VkDevice d, VkPipelineLayout l, const VkAllocationCallbacks *a) {
     free(hdel(&layouts, HK(l)));
+    compat_layout_destroy(l);
     real_dpl(d, l, a);
 }
 
@@ -799,8 +941,9 @@ typedef struct {
     uint8_t dyncull;    /* VK_DYNAMIC_STATE_CULL_MODE */
     uint8_t skip;       /* tem geometry/tessellation: a topologia não diz o que é rasterizado */
     uint8_t drawid;     /* lê gl_DrawID do push constant */
+    uint8_t cnt;        /* VS com o teste do draw_indirect_count (endereço em pc_off8) */
     VkPipelineLayout layout;
-    uint32_t pc_off, pc_stages;
+    uint32_t pc_off, pc_stages, pc_off8;
 } PInfo;
 static HMap pipes = HMAP_INIT;
 static int any_drawid_pipe;
@@ -817,7 +960,7 @@ typedef struct {
     VkShaderModule tmp[MAXST + 2]; int ntmp;
     /* nós VkShaderModuleCreateInfo desligados da cadeia do app (restaurados depois) */
     struct { VkBaseInStructure *prev; const VkBaseInStructure *node; } unl[MAXST]; int nunl;
-    uint8_t drawid, poly;
+    uint8_t drawid, poly, cnt;
 } PWork;
 
 static const VkShaderModuleCreateInfo *inline_module(const VkPipelineShaderStageCreateInfo *s, const VkBaseInStructure **prev) {
@@ -851,9 +994,9 @@ static int has_dyn(const VkGraphicsPipelineCreateInfo *ci, VkDynamicState st) {
 
 /* variante do último estágio com clip/clamp/drawid; devolve o módulo e guarda as palavras em *keep */
 static VkShaderModule build_prerast(VkDevice d, const uint32_t *src, size_t src_nw, const char *ep, int loc, int clamp,
-                                    int drawid, int *nvec, unsigned *done, uint32_t **keep, size_t *keep_nw) {
+                                    int drawid, int cnt8, int negz, int *nvec, unsigned *done, uint32_t **keep, size_t *keep_nw) {
     size_t o = 0;
-    uint32_t *p = spvemu_prerast(src, src_nw, ep, loc, clamp, drawid, &o, nvec, done);
+    uint32_t *p = spvemu_prerast2(src, src_nw, ep, loc, clamp, drawid, cnt8, negz, &o, nvec, done);
     if (!p) return VK_NULL_HANDLE;
     uint32_t *final = p, *cc = NULL, *fx = NULL; size_t final_nw = o, cc_nw = 0, t;
     if (*done & SPVEMU_DID_CLIP) {
@@ -923,36 +1066,47 @@ static int prep_stages(VkDevice d, const VkGraphicsPipelineCreateInfo *ci, PWork
     int discard = rs && rs->rasterizerDiscardEnable;
     if (last < 0 || !code[last] || discard) goto out;
     const char *ep = w->st[last].pName;
-    int want_clip = 0, want_clamp = 0, want_drawid = -1, want_poly = 0;
+    int want_clip = 0, want_clamp = 0, want_drawid = -1, want_poly = 0, want_cnt8 = -1, want_negz = 0;
+    /* VK_EXT_depth_clip_control (v4.9.4): z do app em [-w, w] */
+    if (ci->pViewportState)
+        for (const VkBaseInStructure *b = ci->pViewportState->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT &&
+                ((const VkPipelineViewportDepthClipControlCreateInfoEXT *)b)->negativeOneToOne) want_negz = 1;
     SpvInfo li, fi;
     memset(&fi, 0, sizeof fi);
     if (EMU_CLIP && pre[last] && !spvemu_info(pre[last], pre_nw[last], ep, &li) && li.clip_n > 0) want_clip = 1;
-    if (EMU_CLAMP && rs && rs->depthClampEnable) want_clamp = 1;
+    if (EMU_CLAMP && rs && rs->depthClampEnable) {
+        want_clamp = clamp_on;
+        /* com gl_FragDepth o depth bias do rasterizador se perde: esses pipelines ficam no modo por vértice */
+        if (want_clamp == 2 && (rs->depthBiasEnable || has_dyn(ci, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE))) want_clamp = 1;
+    }
     if (EMU_NONSOLID && rs && rs->polygonMode != VK_POLYGON_MODE_FILL && only_vs && ci->pInputAssemblyState &&
         ci->pInputAssemblyState->topology >= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
         ci->pInputAssemblyState->topology <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) want_poly = 1;
-    if (EMU_DRAWID && ci->layout) {
+    if ((EMU_DRAWID || compat_count_on) && ci->layout) {
         int vs = -1;
         for (uint32_t s = 0; s < n; s++) if (w->st[s].stage == VK_SHADER_STAGE_VERTEX_BIT) vs = (int)s;
         SpvInfo vi;
         LInfo *lay = hget(&layouts, HK(ci->layout));
-        if (vs >= 0 && code[vs] && lay && !spvemu_info(code[vs], nw[vs], w->st[vs].pName, &vi) && vi.has_drawindex) {
+        int cnt_here = compat_count_on && lay && lay->off8;
+        if (vs >= 0 && code[vs] && lay && !spvemu_info(code[vs], nw[vs], w->st[vs].pName, &vi) && (vi.has_drawindex || cnt_here)) {
             want_drawid = (int)lay->off;
+            if (cnt_here) want_cnt8 = (int)lay->off8;
             if (vs != last) {
                 /* VS não é o último estágio: variante só do VS com o gl_DrawID */
                 int nv; unsigned done; uint32_t *k = NULL; size_t kn;
-                VkShaderModule m = build_prerast(d, code[vs], nw[vs], w->st[vs].pName, -1, 0, want_drawid, &nv, &done, &k, &kn);
+                VkShaderModule m = build_prerast(d, code[vs], nw[vs], w->st[vs].pName, -1, 0, want_drawid, want_cnt8, 0, &nv, &done, &k, &kn);
                 free(k);
-                if (m) { add_tmp(w, m); w->st[vs].module = m; w->drawid = 1; changed = 1; __sync_fetch_and_add(&n_emu_drawid, 1); }
+                if (m) { add_tmp(w, m); w->st[vs].module = m; w->drawid = 1; if (done & SPVEMU_DID_COUNT) w->cnt = 1; changed = 1; __sync_fetch_and_add(&n_emu_drawid, 1); }
                 else __sync_fetch_and_add(&n_emu_fail, 1);
-                want_drawid = -1;
+                want_drawid = -1; want_cnt8 = -1;
             }
         }
     }
-    /* clip precisa de uma location livre dos dois lados e de um fragment shader para o discard */
-    int loc = -1, fs_new = 0;
-    if (want_clip) {
-        int fs_ok = 0;
+    /* clip e depthClamp exato precisam de location livre dos dois lados e de um fragment shader */
+    int loc = -1, cloc = -1, fs_new = 0, fs_ok = 0, clip_nv = 0;
+    float mind = 0.f, maxd = 1.f;
+    if (want_clip || want_clamp == 2) {
         if (fs >= 0 && code[fs] && !spvemu_info(code[fs], nw[fs], w->st[fs].pName, &fi) && fi.model == 4) fs_ok = 1;
         if (fs < 0) {
             /* sem fragment shader: só se nenhuma cor é escrita */
@@ -961,26 +1115,55 @@ static int prep_stages(VkDevice d, const VkGraphicsPipelineCreateInfo *ci, PWork
             if (cb && cb->pAttachments) for (uint32_t i = 0; i < cb->attachmentCount; i++) if (cb->pAttachments[i].colorWriteMask) writes = 1;
             if (!writes) { fs_ok = 1; fs_new = 1; }
         }
-        int nvec = (li.clip_n + 3) / 4;
-        loc = li.out_loc_end > fi.in_loc_end ? li.out_loc_end : fi.in_loc_end;
-        if (!fs_ok || loc + nvec > (int)max_out_vec) { want_clip = 0; __sync_fetch_and_add(&n_emu_fail, 1); }
     }
-    if (want_clip || want_clamp || want_drawid >= 0) {
+    if (want_clip) {
+        clip_nv = (li.clip_n + 3) / 4;
+        loc = li.out_loc_end > fi.in_loc_end ? li.out_loc_end : fi.in_loc_end;
+        if (!fs_ok || loc + clip_nv > (int)max_out_vec) { want_clip = 0; __sync_fetch_and_add(&n_emu_fail, 1); }
+    }
+    if (want_clamp == 2) {
+        SpvInfo lc;
+        if (want_clip) lc = li;
+        else if (spvemu_info(code[last], nw[last], ep, &lc)) { want_clamp = 1; goto clamp_done; }
+        cloc = lc.out_loc_end > fi.in_loc_end ? lc.out_loc_end : fi.in_loc_end;
+        if (want_clip && cloc < loc + clip_nv) cloc = loc + clip_nv;
+        if (!fs_ok || cloc + 1 > (int)max_out_vec) { want_clamp = 1; goto clamp_done; }
+        /* intervalo de profundidade do viewport estático; dinâmico: assume [0, 1] */
+        if (!has_dyn(ci, VK_DYNAMIC_STATE_VIEWPORT) && !has_dyn(ci, VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT) &&
+            ci->pViewportState && ci->pViewportState->pViewports) {
+            mind = ci->pViewportState->pViewports[0].minDepth; maxd = ci->pViewportState->pViewports[0].maxDepth;
+        }
+    }
+clamp_done:
+    if (want_clip || want_clamp || want_drawid >= 0 || want_negz) {
         int nvec = 0; unsigned done = 0;
+        int cl = want_clamp == 2 ? SPVEMU_CLAMP_EXACT + cloc : want_clamp;
         VkShaderModule m = build_prerast(d, want_clip ? pre[last] : code[last], want_clip ? pre_nw[last] : nw[last], ep,
-                                         want_clip ? loc : -1, want_clamp, want_drawid, &nvec, &done, &vsw, &vsw_n);
+                                         want_clip ? loc : -1, cl, want_drawid, want_cnt8, want_negz, &nvec, &done, &vsw, &vsw_n);
         VkShaderModule fsm = VK_NULL_HANDLE;
-        if (m && (done & SPVEMU_DID_CLIP)) {
+        if (m && (done & (SPVEMU_DID_CLIP | SPVEMU_DID_CLAMPX))) {
             size_t fo = 0;
-            uint32_t *f = fs_new ? spvemu_fs_new(loc, nvec, &fo) : spvemu_fs_clip(code[fs], nw[fs], w->st[fs].pName, loc, nvec, &fo);
+            uint32_t *f = NULL;
+            const char *fep = fs_new ? "main" : w->st[fs].pName;
+            if (done & SPVEMU_DID_CLIP)
+                f = fs_new ? spvemu_fs_new(loc, nvec, &fo) : spvemu_fs_clip(code[fs], nw[fs], fep, loc, nvec, &fo);
+            if (done & SPVEMU_DID_CLAMPX) {
+                if (done & SPVEMU_DID_CLIP) {
+                    size_t go = 0;
+                    uint32_t *g = f ? spvemu_fs_clamp(f, fo, fep, cloc, mind, maxd, &go) : NULL;
+                    free(f); f = g; fo = go;
+                } else {
+                    f = fs_new ? spvemu_fs_depth_new(cloc, mind, maxd, &fo) : spvemu_fs_clamp(code[fs], nw[fs], fep, cloc, mind, maxd, &fo);
+                }
+            }
             fsm = f ? make_module(d, f, fo) : VK_NULL_HANDLE;
             free(f);
-            if (!fsm) {   /* sem o discard a variante não serve: refaz sem clip */
+            if (!fsm) {   /* sem o FS a variante não serve: refaz sem clip e com o clamp por vértice */
                 real_dsm(d, m, NULL); m = VK_NULL_HANDLE;
                 free(vsw); vsw = NULL;
                 __sync_fetch_and_add(&n_emu_fail, 1);
-                if (want_clamp || want_drawid >= 0)
-                    m = build_prerast(d, code[last], nw[last], ep, -1, want_clamp, want_drawid, &nvec, &done, &vsw, &vsw_n);
+                if (want_clamp || want_drawid >= 0 || want_negz)
+                    m = build_prerast(d, code[last], nw[last], ep, -1, want_clamp ? 1 : 0, want_drawid, want_cnt8, want_negz, &nvec, &done, &vsw, &vsw_n);
             }
         }
         if (m) {
@@ -994,12 +1177,14 @@ static int prep_stages(VkDevice d, const VkGraphicsPipelineCreateInfo *ci, PWork
                     ns->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                     ns->stage = VK_SHADER_STAGE_FRAGMENT_BIT; ns->module = fsm; ns->pName = "main";
                 } else w->st[fs].module = fsm;
-                __sync_fetch_and_add(&n_emu_clip, 1);
+                if (done & SPVEMU_DID_CLIP) __sync_fetch_and_add(&n_emu_clip, 1);
             }
             if (done & SPVEMU_DID_CLAMP) __sync_fetch_and_add(&n_emu_clamp, 1);
+            if ((done & SPVEMU_DID_CLAMPX) && fsm) __sync_fetch_and_add(&n_emu_clampx, 1);
             if (done & SPVEMU_DID_DRAWID) { __sync_fetch_and_add(&n_emu_drawid, 1); w->drawid = 1; }
+            if (done & SPVEMU_DID_COUNT) w->cnt = 1;
             changed = 1;
-        } else if (want_clip || want_clamp || want_drawid >= 0) __sync_fetch_and_add(&n_emu_fail, 1);
+        } else if (want_clip || want_clamp || want_drawid >= 0 || want_negz) __sync_fetch_and_add(&n_emu_fail, 1);
     }
     if (want_poly) {
         /* fillModeNonSolid: GS que transforma triângulos em arestas/vértices */
@@ -1033,7 +1218,7 @@ out:
     return changed;
 }
 
-static void pinfo_register(const VkGraphicsPipelineCreateInfo *ci, VkPipeline p, int drawid, int poly) {
+static void pinfo_register(const VkGraphicsPipelineCreateInfo *ci, VkPipeline p, int drawid, int poly, int cnt) {
     PInfo pi = { 0 };
     const VkPipelineDynamicStateCreateInfo *dy = ci->pDynamicState;
     if (dy) for (uint32_t i = 0; i < dy->dynamicStateCount; i++) if (dy->pDynamicStates[i] == VK_DYNAMIC_STATE_CULL_MODE) pi.dyncull = 1;
@@ -1045,7 +1230,10 @@ static void pinfo_register(const VkGraphicsPipelineCreateInfo *ci, VkPipeline p,
     if (poly) { pi.cls = 1; pi.skip = 0; }    /* o GS do wireframe rasteriza linhas/pontos (MK-16) */
     if (drawid) {
         LInfo *li = hget(&layouts, HK(ci->layout));
-        if (li) { pi.drawid = 1; pi.layout = ci->layout; pi.pc_off = li->off; pi.pc_stages = li->stages; any_drawid_pipe = 1; }
+        if (li) {
+            pi.drawid = 1; pi.layout = ci->layout; pi.pc_off = li->off; pi.pc_stages = li->stages; any_drawid_pipe = 1;
+            if (cnt && li->off8) { pi.cnt = 1; pi.pc_off8 = li->off8; }
+        }
     }
     if (!pi.dyncull && !pi.drawid) return;
     PInfo *h = malloc(sizeof *h);
@@ -1059,16 +1247,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cgp(VkDevice d, VkPipelineCache pc, uin
     VkGraphicsPipelineCreateInfo *cc = malloc(n * sizeof *cc);
     VkPipelineRasterizationStateCreateInfo *rs = calloc(n, sizeof *rs);
     VkPipelineViewportStateCreateInfo *vs = calloc(n, sizeof *vs);
+    VkPipelineRasterizationStateCreateInfo *rsc = calloc(n, sizeof *rsc);
     PWork *pw = calloc(n, sizeof *pw);
-    if (!cc || !rs || !vs || !pw) {
-        free(cc); free(rs); free(vs); free(pw);
+    if (!cc || !rs || !vs || !pw || !rsc) {
+        free(cc); free(rs); free(vs); free(pw); free(rsc);
         return real_cgp(d, pc_for(d, pc), n, ci, a, out);
     }
     memcpy(cc, ci, n * sizeof *cc);
     for (uint32_t i = 0; i < n; i++) {
-        if (prep_stages(d, &ci[i], &pw[i])) { cc[i].pStages = pw[i].st; cc[i].stageCount = pw[i].nst; }
-        const VkPipelineRasterizationStateCreateInfo *r = ci[i].pRasterizationState;
+        /* VK_EXT_depth_clip_enable (v4.9.2): sem corte de profundidade = depthClamp emulado;
+         * com corte, o clamp não muda nada visível e fica desligado (sem custo) */
+        int clip_en;
+        if (compat_depth_clip(ci[i].pRasterizationState, &clip_en)) {
+            rsc[i] = *ci[i].pRasterizationState;
+            rsc[i].depthClampEnable = clip_en ? VK_FALSE : VK_TRUE;
+            const VkBaseInStructure *f = rsc[i].pNext;
+            if (f && f->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT) rsc[i].pNext = f->pNext;
+            cc[i].pRasterizationState = &rsc[i];
+        }
+        if (prep_stages(d, &cc[i], &pw[i])) { cc[i].pStages = pw[i].st; cc[i].stageCount = pw[i].nst; }
+        const VkPipelineRasterizationStateCreateInfo *r = cc[i].pRasterizationState;
         const VkPipelineViewportStateCreateInfo *v = ci[i].pViewportState;
+        if (v && v->pNext && ((const VkBaseInStructure *)v->pNext)->sType == VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT) {
+            vs[i] = *v; vs[i].pNext = ((const VkBaseInStructure *)v->pNext)->pNext;
+            cc[i].pViewportState = &vs[i]; v = &vs[i];
+        }
         int fix_r = r && ((!realf.depthClamp && r->depthClampEnable) ||
                           (!realf.fillModeNonSolid && r->polygonMode != VK_POLYGON_MODE_FILL));
         int fix_v = v && !realf.multiViewport && (v->viewportCount > 1 || v->scissorCount > 1);
@@ -1077,19 +1280,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cgp(VkDevice d, VkPipelineCache pc, uin
             cc[i].pRasterizationState = &rs[i];
         }
         if (fix_v) {
-            vs[i] = *v;
+            if (v != &vs[i]) vs[i] = *v;
             if (vs[i].viewportCount > 1) vs[i].viewportCount = 1;
             if (vs[i].scissorCount > 1) vs[i].scissorCount = 1;
             cc[i].pViewportState = &vs[i];
         }
     }
+    if (dbg) for (uint32_t i = 0; i < n; i++) {
+        const VkPipelineRasterizationStateCreateInfo *r0 = ci[i].pRasterizationState;
+        const VkPipelineViewportStateCreateInfo *v0 = ci[i].pViewportState;
+        LOGI("pipe: estagios=%u clamp=%d bias=%d(dyn %d) poly=%d cull=%d vp=%s%.2f..%.2f(dyn %d) zfmt_dyn=%d",
+             ci[i].stageCount, r0 ? (int)r0->depthClampEnable : -1, r0 ? (int)r0->depthBiasEnable : -1,
+             has_dyn(&ci[i], VK_DYNAMIC_STATE_DEPTH_BIAS), r0 ? (int)r0->polygonMode : -1, r0 ? (int)r0->cullMode : -1,
+             (v0 && v0->pViewports) ? "" : "-", (v0 && v0->pViewports) ? v0->pViewports[0].minDepth : 0.f,
+             (v0 && v0->pViewports) ? v0->pViewports[0].maxDepth : 0.f,
+             has_dyn(&ci[i], VK_DYNAMIC_STATE_VIEWPORT) || has_dyn(&ci[i], VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT),
+             has_dyn(&ci[i], VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT));
+    }
+    long long t0 = hud_on ? mono_ns() : 0;
     VkResult r = real_cgp(d, pc_for(d, pc), n, cc, a, out);
-    __sync_fetch_and_add(&n_pipe_total, n);
+    if (hud_on) hud_pipe(mono_ns() - t0, n);
+    int tot = __sync_add_and_fetch(&n_pipe_total, n);
+    if (dbg && (tot / 16) != ((tot - (int)n) / 16))
+        LOGI("stats: pipelines=%d falhas=%d | emu clip=%d clamp=%d(exato %d) drawid=%d wire=%d falhou=%d",
+             tot, n_pipe_fail, n_emu_clip, n_emu_clamp, n_emu_clampx, n_emu_drawid, n_emu_poly, n_emu_fail);
     for (uint32_t i = 0; i < n; i++) {
         /* restaura as cadeias do app e destrói os módulos temporários */
         for (int k = 0; k < pw[i].nunl; k++) pw[i].unl[k].prev->pNext = pw[i].unl[k].node;
         for (int k = 0; k < pw[i].ntmp; k++) real_dsm(d, pw[i].tmp[k], NULL);
-        if (out[i] != VK_NULL_HANDLE && (errata_on || pw[i].drawid || pw[i].poly)) pinfo_register(&ci[i], out[i], pw[i].drawid, pw[i].poly);
+        if (out[i] != VK_NULL_HANDLE && (errata_on || pw[i].drawid || pw[i].poly)) pinfo_register(&ci[i], out[i], pw[i].drawid, pw[i].poly, pw[i].cnt);
     }
     if (r < 0) {
         for (uint32_t i = 0; i < n; i++) {
@@ -1099,7 +1318,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_cgp(VkDevice d, VkPipelineCache pc, uin
             if (dbg && idx < 60) dump_fail(idx, r, &ci[i]);
         }
     }
-    free(cc); free(rs); free(vs); free(pw);
+    free(cc); free(rs); free(vs); free(pw); free(rsc);
     return r;
 }
 
@@ -1208,7 +1427,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_acb(VkDevice d, const VkCommandBufferAl
     return r;
 }
 static VKAPI_ATTR void VKAPI_CALL my_fcb(VkDevice d, VkCommandPool p, uint32_t n, const VkCommandBuffer *c) {
-    for (uint32_t i = 0; i < n; i++) if (c[i]) free(hdel(&cbs, HK(c[i])));
+    for (uint32_t i = 0; i < n; i++) if (c[i]) { free(hdel(&cbs, HK(c[i]))); compat_cb_free(c[i]); }
     real_fcb(d, p, n, c);
 }
 static VKAPI_ATTR void VKAPI_CALL my_dcp(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) {
@@ -1217,7 +1436,7 @@ static VKAPI_ATTR void VKAPI_CALL my_dcp(VkDevice d, VkCommandPool p, const VkAl
     for (int b = 0; b < 1024; b++)
         for (HEnt **pp = &cbs.b[b]; *pp;) {
             CbSt *s = (*pp)->v;
-            if (s->pool == p) { HEnt *e = *pp; *pp = e->next; free(e->v); free(e); }
+            if (s->pool == p) { HEnt *e = *pp; *pp = e->next; compat_cb_free((VkCommandBuffer)(uintptr_t)e->k); free(e->v); free(e); }
             else pp = &(*pp)->next;
         }
     pthread_mutex_unlock(&cbs.mu);
@@ -1226,6 +1445,7 @@ static VKAPI_ATTR void VKAPI_CALL my_dcp(VkDevice d, VkCommandPool p, const VkAl
 static VKAPI_ATTR VkResult VKAPI_CALL my_bcb(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
     CbSt *s = hget(&cbs, HK(cb));
     if (s) cb_reset(s);
+    compat_cb_begin(cb);
     return real_bcb(cb, bi);
 }
 static VKAPI_ATTR void VKAPI_CALL my_cec(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *sec) {
@@ -1262,6 +1482,7 @@ static VKAPI_ATTR void VKAPI_CALL my_cbp(VkCommandBuffer cb, VkPipelineBindPoint
     if (pi) { s->pipe = *pi; s->has_pipe = 1; }
     else { memset(&s->pipe, 0, sizeof s->pipe); s->has_pipe = 0; }
     s->pc_valid = 0;
+    if (s->has_pipe && s->pipe.cnt) { uint64_t z = 0; real_cpush(cb, s->pipe.layout, s->pipe.pc_stages, s->pipe.pc_off8, 8, &z); }
     if (!errata_on) return;
     if (s->has_pipe && s->pipe.dyncull) cull_apply(cb, s);
     else { s->cull_valid = 0; s->sent_valid = 0; }   /* pipeline com cull estático encerra o valor dinâmico */
@@ -1278,22 +1499,27 @@ static inline void drawid_set(VkCommandBuffer cb, CbSt *s, uint32_t v) {
     real_cpush(cb, s->pipe.layout, s->pipe.pc_stages, s->pipe.pc_off, 4, &v);
     s->pc_val = v; s->pc_valid = 1;
 }
+static void shim_drawid(VkCommandBuffer cb, uint32_t i) { CbSt *s = drawid_cb(cb); if (s) drawid_set(cb, s, i); hud_draws++; }
 static VKAPI_ATTR void VKAPI_CALL my_cdraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    hud_draws++;
     CbSt *s = drawid_cb(cb);
     if (s) drawid_set(cb, s, 0);
     real_cdraw(cb, vc, ic, fv, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL my_cdrawi(VkCommandBuffer cb, uint32_t xc, uint32_t ic, uint32_t fx, int32_t vo, uint32_t fi) {
+    hud_draws++;
     CbSt *s = drawid_cb(cb);
     if (s) drawid_set(cb, s, 0);
     real_cdrawi(cb, xc, ic, fx, vo, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL my_cdi(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, uint32_t n, uint32_t stride) {
+    hud_draws += n;
     CbSt *s = drawid_cb(cb);
     if (n <= 1 || realf.multiDrawIndirect) { if (s) drawid_set(cb, s, 0); real_cdi(cb, b, off, n, stride); return; }
     for (uint32_t i = 0; i < n; i++) { if (s) drawid_set(cb, s, i); real_cdi(cb, b, off + (VkDeviceSize)i * stride, 1, stride); }
 }
 static VKAPI_ATTR void VKAPI_CALL my_cdii(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, uint32_t n, uint32_t stride) {
+    hud_draws += n;
     CbSt *s = drawid_cb(cb);
     if (n <= 1 || realf.multiDrawIndirect) { if (s) drawid_set(cb, s, 0); real_cdii(cb, b, off, n, stride); return; }
     for (uint32_t i = 0; i < n; i++) { if (s) drawid_set(cb, s, i); real_cdii(cb, b, off + (VkDeviceSize)i * stride, 1, stride); }
@@ -1312,6 +1538,10 @@ typedef struct { VkImage img; uint8_t seen; } ViewInfo;
 static HMap views = HMAP_INIT;
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_cimg(VkDevice d, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
+    if (is_bc_format(ci->format) && __sync_fetch_and_add(&bc_seen, 1) == 0) {
+        bc_write(0, 1);
+        if (bc_skipped) LOGI("jogo criou imagem BC sem o PixelBC: na próxima abertura ele volta");
+    }
     VkResult r = real_cimg(d, ci, a, out);
     if (r != VK_SUCCESS) return r;
     int ext = 0;
@@ -1532,6 +1762,52 @@ static VKAPI_ATTR void VKAPI_CALL my_cbr(VkCommandBuffer cb, const VkRenderingIn
     real_cbr(cb, ri);
 }
 
+/* ---- draw_indirect_count (v4.9.4) ----
+ * N = maxDrawCount draws indiretos de 1, cada um com o índice no push constant e o endereço do
+ * contador ao lado; o VS do pipeline (variante) descarta os draws com índice >= contador. */
+static int warned_cnt;
+static void draw_count(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkBuffer cbuf, VkDeviceSize coff,
+                       uint32_t maxn, uint32_t stride, int indexed) {
+    CbSt *s = cb_get(cb);
+    int ok = s && s->has_pipe && s->pipe.cnt && real_gbda && g_dev;
+    if (ok) {
+        VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, 0, cbuf };
+        uint64_t addr = real_gbda(g_dev, &bi) + coff;
+        real_cpush(cb, s->pipe.layout, s->pipe.pc_stages, s->pipe.pc_off8, 8, &addr);
+    } else if (!warned_cnt) { warned_cnt = 1; LOGE("draw_indirect_count: pipeline sem a variante do contador (desenha os %u)", maxn); }
+    hud_draws += maxn;
+    for (uint32_t i = 0; i < maxn; i++) {
+        if (s && s->has_pipe && s->pipe.drawid) drawid_set(cb, s, i);
+        if (indexed) real_cdii(cb, b, off + (VkDeviceSize)i * stride, 1, stride);
+        else real_cdi(cb, b, off + (VkDeviceSize)i * stride, 1, stride);
+    }
+    if (ok) { uint64_t z = 0; real_cpush(cb, s->pipe.layout, s->pipe.pc_stages, s->pipe.pc_off8, 8, &z); }
+}
+static VKAPI_ATTR void VKAPI_CALL my_cdic(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkBuffer cbuf, VkDeviceSize coff, uint32_t maxn, uint32_t stride) {
+    draw_count(cb, b, off, cbuf, coff, maxn, stride, 0);
+}
+static VKAPI_ATTR void VKAPI_CALL my_cdiic(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkBuffer cbuf, VkDeviceSize coff, uint32_t maxn, uint32_t stride) {
+    draw_count(cb, b, off, cbuf, coff, maxn, stride, 1);
+}
+
+/* ---- HUD (v4.9) ---- */
+static VKAPI_ATTR VkResult VKAPI_CALL my_qs(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) { return hud_submit(q, n, s, f, real_qs); }
+static VKAPI_ATTR VkResult VKAPI_CALL my_qs2(VkQueue q, uint32_t n, const VkSubmitInfo2 *s, VkFence f) { return hud_submit2(q, n, s, f, real_qs2); }
+static VKAPI_ATTR void VKAPI_CALL my_gdq(VkDevice d, uint32_t fam, uint32_t idx, VkQueue *q) { real_gdq(d, fam, idx, q); hud_queue(d, *q, fam); }
+static VKAPI_ATTR void VKAPI_CALL my_gdq2(VkDevice d, const VkDeviceQueueInfo2 *i, VkQueue *q) { real_gdq2(d, i, q); hud_queue(d, *q, i->queueFamilyIndex); }
+static PFN_vkWaitForFences real_wff; static PFN_vkWaitSemaphores real_wsem;
+static PFN_vkQueueWaitIdle real_qwi; static PFN_vkDeviceWaitIdle real_dwi;
+#define TIMED(call) do { long long _t = mono_ns(); r = call; __sync_fetch_and_add(&hud_wait_ns, mono_ns() - _t); } while (0)
+static VKAPI_ATTR VkResult VKAPI_CALL my_wff(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t to) { VkResult r; TIMED(real_wff(d, n, f, all, to)); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL my_wsem(VkDevice d, const VkSemaphoreWaitInfo *i, uint64_t to) { VkResult r; TIMED(real_wsem(d, i, to)); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL my_qwi(VkQueue q) { VkResult r; TIMED(real_qwi(q)); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL my_dwi(VkDevice d) { VkResult r; TIMED(real_dwi(d)); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL my_sria(VkQueue q, uint32_t n, const VkSemaphore *w, VkImage img, int *fd) {
+    VkResult r = real_sria(q, n, w, img, fd);
+    hud_present();
+    return r;
+}
+
 /* ======================================================================
  * Tabela de interceptação
  * ====================================================================== */
@@ -1540,6 +1816,18 @@ static VKAPI_ATTR void VKAPI_CALL my_cbr(VkCommandBuffer cb, const VkRenderingIn
 
 static PFN_vkVoidFunction hook(const char *n, PFN_vkVoidFunction r) {
     if (n[0] != 'v' || n[1] != 'k') return r;
+    { PFN_vkVoidFunction cf = compat_hook(n, r); if (cf) return cf; }
+    if (compat_on) {     /* o driver não tem (ou não deve ser usado: recurso 0) */
+        if (!strcmp(n, "vkCmdDrawIndirectCount") || !strcmp(n, "vkCmdDrawIndirectCountKHR") || !strcmp(n, "vkCmdDrawIndirectCountAMD")) return (PFN_vkVoidFunction)my_cdic;
+        if (!strcmp(n, "vkCmdDrawIndexedIndirectCount") || !strcmp(n, "vkCmdDrawIndexedIndirectCountKHR") || !strcmp(n, "vkCmdDrawIndexedIndirectCountAMD")) return (PFN_vkVoidFunction)my_cdiic;
+    }
+    if (!r) return r;
+    if (compat_on) {
+        HOOK("vkCreatePipelineLayout", real_cpl, my_cpl)
+        HOOK("vkDestroyPipelineLayout", real_dpl, my_dpl)
+        HOOK("vkGetPhysicalDeviceMemoryProperties2", real_gpdmp2, my_gpdmp2)
+        HOOK("vkGetPhysicalDeviceMemoryProperties2KHR", real_gpdmp2, my_gpdmp2)
+    }
     /* dispositivo */
     HOOK("vkCreateShaderModule", real_csm, my_csm)
     HOOK("vkDestroyShaderModule", real_dsm, my_dsm)
@@ -1555,6 +1843,23 @@ static PFN_vkVoidFunction hook(const char *n, PFN_vkVoidFunction r) {
     HOOK("vkCmdBindPipeline", real_cbp, my_cbp)
     HOOK("vkCmdSetCullMode", real_scm, my_scm)
     HOOK("vkCmdSetCullModeEXT", real_scm, my_scm)
+    if (hud_on) {
+        HOOK("vkQueueSubmit", real_qs, my_qs)
+        HOOK("vkQueueSubmit2", real_qs2, my_qs2)
+        HOOK("vkQueueSubmit2KHR", real_qs2, my_qs2)
+        HOOK("vkGetDeviceQueue", real_gdq, my_gdq)
+        HOOK("vkGetDeviceQueue2", real_gdq2, my_gdq2)
+        HOOK("vkQueueSignalReleaseImageANDROID", real_sria, my_sria)
+        HOOK("vkWaitForFences", real_wff, my_wff)
+        HOOK("vkWaitSemaphores", real_wsem, my_wsem)
+        HOOK("vkWaitSemaphoresKHR", real_wsem, my_wsem)
+        HOOK("vkQueueWaitIdle", real_qwi, my_qwi)
+        HOOK("vkDeviceWaitIdle", real_dwi, my_dwi)
+        HOOK("vkCmdDraw", real_cdraw, my_cdraw)
+        HOOK("vkCmdDrawIndexed", real_cdrawi, my_cdrawi)
+        HOOK("vkCmdDrawIndirect", real_cdi, my_cdi)
+        HOOK("vkCmdDrawIndexedIndirect", real_cdii, my_cdii)
+    }
     if (fake & F_MDI) {
         HOOK("vkCmdDrawIndirect", real_cdi, my_cdi)
         HOOK("vkCmdDrawIndexedIndirect", real_cdii, my_cdii)
@@ -1604,14 +1909,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_ci(const VkInstanceCreateInfo *ci, cons
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL my_gdpa(VkDevice d, const char *name) {
     PFN_vkVoidFunction r = real_gdpa(d, name);
-    if (!r) return r;
-    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)my_gdpa;
+    if (r && !strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)my_gdpa;
     return hook(name, r);
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL my_gipa(VkInstance inst, const char *name) {
     PFN_vkVoidFunction r = real_gipa(inst, name);
-    if (!r) return r;
+    if (!r) return inst ? hook(name, r) : r;
     if (!strcmp(name, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)my_gipa;
     if (!strcmp(name, "vkGetDeviceProcAddr")) { real_gdpa = (PFN_vkGetDeviceProcAddr)r; return (PFN_vkVoidFunction)my_gdpa; }
     if (!strcmp(name, "vkCreateInstance")) { real_ci = (PFN_vkCreateInstance)r; return (PFN_vkVoidFunction)my_ci; }
@@ -1622,6 +1926,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_ci(const VkInstanceCreateInfo *ci, cons
     VkResult r = real_ci(ci, a, out);
     if (r == VK_SUCCESS) {
         g_inst = *out;
+        compat_gipa = real_gipa; compat_inst = *out;
         /* garante os ponteiros de physical device mesmo se o loader não pedir por nome */
         if (!real_gpdf) real_gpdf = (PFN_vkGetPhysicalDeviceFeatures)real_gipa(*out, "vkGetPhysicalDeviceFeatures");
         if (!real_gpdp) real_gpdp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(*out, "vkGetPhysicalDeviceProperties");
@@ -1651,6 +1956,13 @@ static int my_close(hw_device_t *d) { (void)d; return real_dev->common.close(&re
 
 static int my_open(const hw_module_t *mod, const char *id, hw_device_t **out) {
     load_config();
+    compat_drawid = shim_drawid;
+    hud_init(pkg);
+    bc_load();
+    if (bcn_on && !bcn_forced && bc_prev_sessions >= BC_SESSOES) {
+        bcn_on = 0; bc_skipped = 1;
+        LOGI("PixelBC fora: %d sessões seguidas sem textura BC neste jogo (debug.vkshim.bcn=1 força)", bc_prev_sessions);
+    }
     store_on = (fake & (F_CLIPDIST | F_DEPTHCLAMP | F_MDI | F_NONSOLID)) && (clip_on || clamp_on || drawid_on || nonsolid_on);
     const char *hal = REAL_HAL;
     void *h = NULL;
@@ -1685,8 +1997,9 @@ static int my_open(const hw_module_t *mod, const char *id, hw_device_t **out) {
     my_dev.GetInstanceProcAddr = my_gipa;
     my_dev.CreateInstance = my_ci;
     *out = &my_dev.common;
-    LOGI("vkshim v%s sobre %s | fake=0x%x clip=%d clamp=%d drawid=%d wire=%d errata=%d spv=%d pcache=%d bcn=%d debug=%d | %s",
-         VKSHIM_VERSION, hal, fake, clip_on, clamp_on, drawid_on, nonsolid_on, errata_on, spv_on, pcache_on, bcn_on, dbg, pkg);
+    LOGI("vkshim v%s sobre %s | fake=0x%x clip=%d clamp=%d drawid=%d wire=%d errata=%d spv=%d pcache=%d bcn=%d hud=%d debug=%d | %s%s%s",
+         VKSHIM_VERSION, hal, fake, clip_on, clamp_on, drawid_on, nonsolid_on, errata_on, spv_on, pcache_on, bcn_on, hud_on, dbg, pkg,
+         conf_used[0] ? " | conf " : "", conf_used);
     return 0;
 }
 

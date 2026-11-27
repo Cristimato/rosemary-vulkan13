@@ -1,0 +1,3 @@
+# vkshim v4.9: o HUD lê a frequência e o uso da GPU (ged) de dentro do jogo
+allow untrusted_app_all sysfs_ged dir search
+allow untrusted_app_all sysfs_ged file { open read getattr }

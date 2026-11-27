@@ -37,6 +37,7 @@ static VkDevice dv;
 static VkPhysicalDevice pd;
 static VkQueue qu;
 static VkPhysicalDeviceFeatures feat;
+static int has_dce, has_dcc;
 #define I(n) ((PFN_##n)gi(in, #n))
 #define D(n) ((PFN_##n)gd(dv, #n))
 static const char *dir;
@@ -97,6 +98,8 @@ typedef struct {
     int vtx;               /* 1: binding 0 (stride estático 0) com vec4 na location 0 */
 } PDesc;
 
+static int g_depthclip = -1;
+static int g_negz;        /* VkPipelineViewportDepthClipControlCreateInfoEXT negativeOneToOne */   /* -1: sem VkPipelineRasterizationDepthClipStateCreateInfoEXT; 0/1: depthClipEnable */
 static VkPipeline mkpipe(const PDesc *p) {
     VkShaderModule v = sm(p->vs), f = p->fs ? sm(p->fs) : 0;
     VkPipelineShaderStageCreateInfo st[2] = {
@@ -111,8 +114,12 @@ static VkPipeline mkpipe(const PDesc *p) {
     VkViewport vp = { 0, 0, W, H, 0, 1 };
     VkRect2D sc = { { 0, 0 }, { W, H } };
     VkPipelineViewportStateCreateInfo vs = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, &vp, 1, &sc };
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, 0, VK_TRUE };
+    if (g_negz) vs.pNext = &dcc;
     VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rs.depthClampEnable = p->clamp; rs.polygonMode = p->poly; rs.cullMode = p->cull;
+    VkPipelineRasterizationDepthClipStateCreateInfoEXT dcs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT };
+    if (g_depthclip >= 0) { dcs.depthClipEnable = (VkBool32)g_depthclip; rs.pNext = &dcs; }
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -149,6 +156,8 @@ static void barrier(VkImage img, VkImageAspectFlags asp, VkImageLayout from, VkI
     D(vkCmdPipelineBarrier2)(cb, &di);
 }
 
+static int keep_depth;
+
 /* começa a gravar: alvo limpo (cor 0, profundidade 'clr_depth') e renderização dinâmica aberta */
 static void begin(float clr_depth) {
     D(vkResetCommandBuffer)(cb, 0);
@@ -164,7 +173,7 @@ static void begin(float clr_depth) {
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingAttachmentInfo da = ca;
     da.imageView = dview; da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; da.clearValue.depthStencil.depth = clr_depth;
+    da.storeOp = keep_depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE; da.clearValue.depthStencil.depth = clr_depth;
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     ri.renderArea.extent = (VkExtent2D){ W, H }; ri.layerCount = 1;
     ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca; ri.pDepthAttachment = &da;
@@ -195,6 +204,22 @@ static int finish(void) {
     int n = 0;
     for (int i = 0; i < W * H; i++) if (rptr[i * 4]) n++;
     return n;
+}
+/* como finish(), mas copia a PROFUNDIDADE (D32F) para o buffer de leitura */
+static const float *finish_depth(void) {
+    D(vkCmdEndRendering)(cb);
+    barrier(dimg, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferImageCopy rg = { 0 }; rg.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+    rg.imageExtent = (VkExtent3D){ W, H, 1 };
+    D(vkCmdCopyImageToBuffer)(cb, dimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbuf, 1, &rg);
+    D(vkEndCommandBuffer)(cb);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    D(vkResetFences)(dv, 1, &fence);
+    if (D(vkQueueSubmit)(qu, 1, &si, fence)) { printf("vkQueueSubmit falhou\n"); exit(1); }
+    if (D(vkWaitForFences)(dv, 1, &fence, VK_TRUE, 5000000000ull)) { printf("vkWaitForFences falhou\n"); exit(1); }
+    return (const float *)rptr;
 }
 static int px_r(int x, int y) { return rptr[(y * W + x) * 4]; }
 
@@ -346,6 +371,93 @@ static void test_clamp(float z, const char *name) {
     D(vkDestroyPipeline)(dv, pl, 0);
 }
 
+/* chão que cruza o near e passa por trás da câmera (caso do BT3): conta os pixels contra a
+ * referência calculada na CPU (raio de cada pixel contra o plano do chão, só d > 0) */
+static int in_tri(float px, float pz) {
+    const float ax = -3, az = 10, bx = 3, bz = 10, cx = 0, cz = -2;
+    float d1 = (px - bx) * (az - bz) - (ax - bx) * (pz - bz);
+    float d2 = (px - cx) * (bz - cz) - (bx - cx) * (pz - cz);
+    float d3 = (px - ax) * (cz - az) - (cx - ax) * (pz - az);
+    int neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(neg && pos);
+}
+static void test_clamp_floor(const char *name) {
+    if (!want(name)) return;
+    if (!feat.depthClamp) { skip(name, "depthClamp não anunciado"); return; }
+    PDesc p = { "floor.vert.spv", "col.frag.spv", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, NULL, 0, VK_CULL_MODE_NONE,
+                1, VK_COMPARE_OP_LESS_OR_EQUAL, 1, VK_POLYGON_MODE_FILL };
+    VkPipeline pl = mkpipe(&p); if (!pl) { skip(name, "pipeline falhou"); return; }
+    keep_depth = 1;
+    begin(1.0f);
+    D(vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    push(1, 0, 0, 0.5f);
+    D(vkCmdDraw)(cb, 3, 1, 0, 0);
+    const float *dep = finish_depth();
+    keep_depth = 0;
+    /* referência: raio de cada pixel contra o chão (y = -0.2), z_ndc = A + B/d grampeado em [0, 1] */
+    const float n_ = 1.0f, f_ = 100.0f, A = f_ / (f_ - n_), B = -f_ * n_ / (f_ - n_);
+    int ref = 0, cov = 0, bad = 0; float worst = 0;
+    for (int j = 1; j < H - 1; j++) for (int i = 1; i < W - 1; i++) {
+        float x = (i + 0.5f) / W * 2 - 1, y = (j + 0.5f) / H * 2 - 1;
+        if (y >= 0) continue;
+        float d = -0.2f / y;
+        if (!in_tri(x * d, d)) continue;
+        /* longe das bordas do triângulo (amostragem de borda varia) */
+        if (!in_tri(x * d * 1.03f, d * 1.03f) || !in_tri(x * d * 0.97f, d * 0.97f)) continue;
+        ref++;
+        float zr = A + B / d; if (zr < 0) zr = 0; if (zr > 1) zr = 1;
+        float g = dep[j * W + i];
+        if (g < 1.0f) cov++;
+        float e = g > zr ? g - zr : zr - g;
+        if (e > worst) worst = e;
+        if (e > 0.01f) bad++;
+    }
+    result(name, cov >= ref - 2 && bad == 0,
+           "%d de %d pixels do chão desenhados; %d com profundidade errada (>0.01), pior erro %.3f (z achatado por vértice erra perto da câmera)",
+           cov, ref, bad, worst);
+    D(vkDestroyPipeline)(dv, pl, 0);
+}
+
+/* VK_EXT_depth_clip_enable: sem corte o triângulo fora de [0,1] aparece (grampeado); com corte some */
+static void test_depthclip(int clip, VkBool32 clamp, const char *name) {
+    if (!want(name)) return;
+    if (!has_dce) { skip(name, "VK_EXT_depth_clip_enable não anunciado"); return; }
+    PDesc p = { "tri.vert.spv", "col.frag.spv", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, NULL, 0, VK_CULL_MODE_NONE,
+                1, VK_COMPARE_OP_LESS_OR_EQUAL, clamp, VK_POLYGON_MODE_FILL };
+    g_depthclip = clip;
+    VkPipeline pl = mkpipe(&p);
+    g_depthclip = -1;
+    if (!pl) { skip(name, "pipeline falhou"); return; }
+    begin(1.0f);
+    D(vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    push(1, 0, 0, 1.5f);
+    D(vkCmdDraw)(cb, 3, 1, 0, 0);
+    int n = finish();
+    int want_ = clip ? 0 : W * H;
+    result(name, n == want_, "%d pixels com z=1.50 (depthClipEnable=%d depthClampEnable=%u: esperado %d)", n, clip, clamp, want_);
+    D(vkDestroyPipeline)(dv, pl, 0);
+}
+
+/* VK_EXT_depth_clip_control: z = -0.5 na convenção do OpenGL vira profundidade 0.25 (sem: cortado) */
+static void test_negz(const char *name) {
+    if (!want(name)) return;
+    if (!has_dcc) { skip(name, "VK_EXT_depth_clip_control não anunciado"); return; }
+    PDesc p = { "tri.vert.spv", "col.frag.spv", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, NULL, 0, VK_CULL_MODE_NONE,
+                1, VK_COMPARE_OP_LESS_OR_EQUAL, 0, VK_POLYGON_MODE_FILL };
+    g_negz = 1; VkPipeline pl = mkpipe(&p); g_negz = 0;
+    if (!pl) { skip(name, "pipeline falhou"); return; }
+    keep_depth = 1;
+    begin(1.0f);
+    D(vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    push(1, 0, 0, -0.5f);
+    D(vkCmdDraw)(cb, 3, 1, 0, 0);
+    const float *dep = finish_depth();
+    keep_depth = 0;
+    float zc = dep[(H / 2) * W + W / 2];
+    result(name, zc > 0.24f && zc < 0.26f, "profundidade no centro %.3f (esperado 0.250; sem a emulação o triângulo é cortado: 1.000)", zc);
+    D(vkDestroyPipeline)(dv, pl, 0);
+}
+
 static void test_mdi(const char *name) {
     if (!want(name)) return;
     if (!feat.multiDrawIndirect) { skip(name, "multiDrawIndirect não anunciado"); return; }
@@ -437,6 +549,12 @@ int main(int c, char **v) {
     uint32_t n = 1; I(vkEnumeratePhysicalDevices)(in, &n, &pd);
     I(vkGetPhysicalDeviceFeatures)(pd, &feat);
     VkPhysicalDeviceProperties pr; I(vkGetPhysicalDeviceProperties)(pd, &pr);
+    {
+        uint32_t ne = 0; I(vkEnumerateDeviceExtensionProperties)(pd, NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne, sizeof *ep); I(vkEnumerateDeviceExtensionProperties)(pd, NULL, &ne, ep);
+        for (uint32_t i = 0; i < ne; i++) { if (!strcmp(ep[i].extensionName, "VK_EXT_depth_clip_enable")) has_dce = 1; if (!strcmp(ep[i].extensionName, "VK_EXT_depth_clip_control")) has_dcc = 1; }
+        free(ep);
+    }
     printf("GPU %s drv 0x%x | anunciado: clip=%u depthClamp=%u nonSolid=%u MDI=%u\n", pr.deviceName, pr.driverVersion,
            feat.shaderClipDistance, feat.depthClamp, feat.fillModeNonSolid, feat.multiDrawIndirect);
     float pri = 1; VkDeviceQueueCreateInfo q = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, 0, 0, 0, 1, &pri };
@@ -462,7 +580,7 @@ int main(int c, char **v) {
     ic.mipLevels = ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
     ic.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     D(vkCreateImage)(dv, &ic, 0, &cimg);
-    ic.format = VK_FORMAT_D32_SFLOAT; ic.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ic.format = VK_FORMAT_D32_SFLOAT; ic.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     D(vkCreateImage)(dv, &ic, 0, &dimg);
     VkMemoryRequirements mr;
     D(vkGetImageMemoryRequirements)(dv, cimg, &mr);
@@ -508,6 +626,10 @@ int main(int c, char **v) {
     test_clip("clipv.vert.spv", "colv.frag.spv", 1, "clip_solto");
     test_clamp(1.5f, "clamp_alem_far");
     test_clamp(-0.5f, "clamp_antes_near");
+    test_clamp_floor("clamp_chao");
+    test_depthclip(0, VK_FALSE, "depthclip_off_far");
+    test_depthclip(1, VK_TRUE, "depthclip_on_far");
+    test_negz("depthclip_control_gl");
     test_mdi("mdi_drawid");
     test_poly(VK_POLYGON_MODE_LINE, VK_CULL_MODE_NONE, 1, 1, "line_wireframe");
     test_poly(VK_POLYGON_MODE_POINT, VK_CULL_MODE_NONE, 1, 1, "line_pontos");

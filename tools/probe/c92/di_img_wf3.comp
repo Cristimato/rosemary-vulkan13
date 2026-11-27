@@ -1,0 +1,18 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer O { uint o[64]; };
+layout(set = 0, binding = 1) uniform sampler2D t[4];
+// waterfall com o resultado escolhido fora do if: todas as threads buscam t[f] (uniforme) e só guardam se é delas
+void main() {
+    uint i = gl_LocalInvocationID.x % 4u;
+    uint r = 0u; bool done = false;
+    for (int it = 0; it < 64 && !subgroupAll(done); it++) {
+        uint f = subgroupBroadcastFirst(done ? 0xffffffffu : i);
+        if (f == 0xffffffffu) f = subgroupBroadcastFirst(i);
+        uint v = uint(texelFetch(t[f], ivec2(0), 0).x * 255.0 + 0.5);
+        if (!done && i == f) { r = v; done = true; }
+    }
+    o[gl_LocalInvocationID.x] = r;
+}

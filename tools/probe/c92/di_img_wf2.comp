@@ -1,0 +1,15 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer O { uint o[64]; };
+layout(set = 0, binding = 1) uniform sampler2D t[4];
+// waterfall: cada volta atende as threads com o mesmo índice da primeira thread ativa
+void main() {
+    uint i = gl_LocalInvocationID.x % 4u;
+    uint r = 0u;
+    for (;;) {
+        uint f = subgroupBroadcastFirst(i);
+        if (abs(float(i) - float(f)) < 0.5) { r = uint(texelFetch(t[f], ivec2(0), 0).x * 255.0 + 0.5); break; }
+    }
+    o[gl_LocalInvocationID.x] = r;
+}

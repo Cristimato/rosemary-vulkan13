@@ -1,0 +1,5 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer O { uint o[4]; };
+layout(set = 0, binding = 1, r32ui) uniform uimage2D si;
+void main() { o[0] = imageLoad(si, ivec2(0)).x + 1u; imageStore(si, ivec2(0), uvec4(7)); o[3] = 12345u; }

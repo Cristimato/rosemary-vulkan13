@@ -1,0 +1,19 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer O { uint o[64]; };
+layout(set = 0, binding = 1) uniform sampler2D t[4];
+// waterfall sem vote: em cada volta as threads que faltam escolhem o índice da primeira delas;
+// a busca fica FORA do if (i == f) para o compilador não trocar t[f] por t[i]
+void main() {
+    uint i = gl_LocalInvocationID.x % 4u;
+    uint r = 0u; bool done = false;
+    for (int it = 0; it < 16; it++) {
+        if (!done) {
+            uint f = subgroupBroadcastFirst(i);
+            uint v = uint(texelFetch(t[f], ivec2(0), 0).x * 255.0 + 0.5);
+            if (i == f) { r = v; done = true; }
+        }
+    }
+    o[gl_LocalInvocationID.x] = r;
+}

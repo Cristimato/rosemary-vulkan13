@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Mostra ao vivo o HUD do vkshim de um jogo (precisa de hud=1: vkshim-conf <pacote> set hud=1).
+#   vkshim-hud <pacote>          acompanha (Ctrl+C sai)
+#   vkshim-hud <pacote> resumo   médias da última sessão
+P=${1:?uso: vkshim-hud <pacote> [resumo]}
+F=/sdcard/Android/data/$P/vkshim_hud.csv
+su -c "test -f $F" || F=/data/data/$P/cache/vkshim_hud.csv
+su -c "test -f $F" || { echo "sem CSV do HUD para $P (hud=1 e jogo aberto?)"; exit 1; }
+fmt='{ printf "%5ss %5.1f fps | quadro %5.1f ms p95 %5.1f pior %6.1f | espera %5.1f ms lat %5s ms | %4s draws %4s subm | pipes %3s (%6s ms) | %4s MHz uso %3s%% | %5s C\n", $1,$2,$3,$4,$5,$6,$7,$9,$8,$10,$11,$12,$13,$14 }'
+if [ "$2" = resumo ]; then
+  su -c "cat $F" | awk -F, 'NR>1 && $2>0 { n++; f+=$2; q+=$3; if ($5>m) m=$5; g+=$6; gn++; p+=$10; pm+=$11; if ($12>0){mh+=$12; mn++}; if ($14>0){t+=$14; tn++; if ($14>tm) tm=$14} }
+    END { if (!n) { print "sem dados"; exit } printf "%d s | %.1f fps médio | quadro %.1f ms (pior %.1f) | esperando a GPU %.1f ms/quadro | %d pipes compilados (%.0f ms) | %.0f MHz médio | %.1f C médio, %.1f máx\n", n, f/n, q/n, m, gn?g/gn:-1, p, pm, mn?mh/mn:-1, tn?t/tn:-1, tm }'
+  exit 0
+fi
+su -c "tail -n +2 -f $F" | awk -F, "$fmt"

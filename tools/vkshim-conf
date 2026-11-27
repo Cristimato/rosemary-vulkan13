@@ -1,0 +1,30 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Config do vkshim por jogo (v4.9). Grava /sdcard/Android/data/<pacote>/vkshim.conf
+# (o jogo lê ao abrir; reabra o jogo depois de mudar).
+#   vkshim-conf <pacote> [show]          mostra a config
+#   vkshim-conf <pacote> set k=v ...     define chaves (hud clamp clip drawid errata nonsolid bcn fake spv pcache debug)
+#   vkshim-conf <pacote> unset k ...     remove chaves
+#   vkshim-conf <pacote> rm              apaga o arquivo (volta ao padrão)
+#   vkshim-conf list                     jogos com vkshim.conf
+set -e
+case "$1" in ""|-h|--help) sed -n '2,9p' "$0"; exit 0;; esac
+if [ "$1" = list ]; then su -c 'ls /sdcard/Android/data/*/vkshim.conf 2>/dev/null' | sed 's#/sdcard/Android/data/##; s#/vkshim.conf##'; exit 0; fi
+P=$1; shift; CMD=${1:-show}; [ $# -gt 0 ] && shift
+D=/sdcard/Android/data/$P; F=$D/vkshim.conf
+U=$(su -c "stat -c %u /data/data/$P" 2>/dev/null) || { echo "pacote não instalado: $P"; exit 1; }
+cur() { su -c "cat $F 2>/dev/null" | grep -v '^#' | grep '=' || true; }
+save() { # stdin = linhas k=v
+  T=$(mktemp -p "${TMPDIR:-/data/local/tmp}"); { echo "# vkshim.conf — gerado por vkshim-conf $(date '+%F %T')"; cat; } > "$T"
+  su -c "mkdir -p $D && cp $T $F && chown $U:ext_data_rw $F $D && chmod 660 $F"; rm -f "$T"
+}
+case "$CMD" in
+  show) if su -c "test -f $F"; then su -c "cat $F"; else echo "(sem vkshim.conf: padrão)"; fi ;;
+  set)  [ $# -gt 0 ] || { echo "uso: vkshim-conf $P set k=v ..."; exit 1; }
+        C=$(cur); for kv in "$@"; do k=${kv%%=*}; C=$(printf '%s\n' "$C" | grep -v "^$k=" || true); C=$(printf '%s\n%s' "$C" "$kv"); done
+        printf '%s\n' "$C" | grep '=' | save; su -c "cat $F" ;;
+  unset) C=$(cur); for k in "$@"; do C=$(printf '%s\n' "$C" | grep -v "^$k=" || true); done
+        printf '%s\n' "$C" | grep '=' | save || save </dev/null; su -c "cat $F" ;;
+  rm)   su -c "rm -f $F"; echo "removido: $F" ;;
+  *)    echo "comando desconhecido: $CMD"; exit 1 ;;
+esac
+echo "(reabra o jogo para valer)"

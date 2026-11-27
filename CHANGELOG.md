@@ -1,5 +1,74 @@
 # Changelog
 
+## v5.0 — 2026-11-27
+
+Junta o trabalho das versões internas 4.8 a 4.9.4 (não publicadas separadamente). O foco é
+compatibilidade: quase tudo que jogos e camadas de tradução (DXVK/VKD3D) pedem do Vulkan 1.3 está
+nativo ou emulado. Desempenho fica para a v5.7.
+
+### v4.9.4 — draw_indirect_count e depth_clip_control
+- `VK_KHR_draw_indirect_count` / `drawIndirectCount`: N = maxDrawCount draws indiretos; o índice e o
+  endereço do contador (buffer device address) vão por push constant e o VS (variante) joga para
+  fora da tela os vértices dos draws com índice >= contador. O vkshim liga `bufferDeviceAddress` e
+  `shaderInt64`, põe `SHADER_DEVICE_ADDRESS` nos buffers indiretos e `DEVICE_ADDRESS` nas alocações
+  (só quando o app pede o recurso). Custo: o VS roda para os draws descartados.
+- `VK_EXT_depth_clip_control`: `negativeOneToOne` vira z' = (z + w) / 2 no último estágio.
+- Waterfall: número de voltas = tamanho do subgroup informado pelo driver (8 na G76).
+- Não feito: `VK_EXT_color_write_enable`. O r49 não tem máscara de cor dinâmica (EDS3
+  colorWriteMask = 0); o estado dinâmico exigiria pipelines sob demanda (até 256 variantes).
+- c92 22 OK / 0 BUG / 1 limite; e47 23/23; 57 módulos válidos.
+
+### v4.9.3 — descriptor indexing completo
+Testado no aparelho antes de emular (probe `c92`, r49 puro): buffers com índice divergente já dão
+certo; imagens/texel não (a G76 usa o índice de uma thread só); descritor nunca escrito derruba o
+job inteiro; update-after-bind vale para imagens/texel e não para buffers; variable count é nativo;
+arrays de 1.000.000 descritores são aceitos em todos os tipos.
+- Índice NonUniform em imagens, storage images, texel buffers e runtime arrays: passe novo
+  `spvemu_waterfall` (laço por `OpGroupNonUniformBroadcastFirst`, busca fora do `if`, que dentro
+  dele o compilador troca `t[f]` por `t[i]`; em fragment shader ImplicitLod vira gradientes
+  calculados antes do laço, bias vira escala 2^bias). Prop/conf `waterfall=0` desliga.
+- Partially bound: bindings preenchidos com os fantasmas do nullDescriptor na alocação do set.
+- Anunciados: `descriptorIndexing` e todos os campos (menos input attachment), extensão
+  `VK_EXT_descriptor_indexing`; limites de update-after-bind = 1.000.000 (nível 3 do D3D12).
+- Capabilities de dynamic indexing de texel buffer (5304/5305) também saem do SPIR-V.
+- Limite: update-after-bind de UBO/SSBO usa o descritor do momento do bind (a Mali copia o
+  descritor de buffer no bind). Imagens e texel buffers (o caso bindless) são reais.
+- c92: shim 21 OK / 0 BUG / 1 limite; r49 puro 7 OK / 14 BUG-CRASH. e47 22/22. 55 módulos válidos.
+
+### v4.9.2 — compatibilidade
+Probe novo `tools/probe/c92` (cada teste em processo próprio; crash vira CRASH): r49 puro 0/5 nos
+nulos (trava em todos), vkshim 10/10. e47 22/22.
+- `VK_EXT_robustness2`: `nullDescriptor` por recursos fantasma zerados (buffer, texel buffer,
+  imagens 1D/2D/array/cube/3D RGBA8, storage R32_UINT sem AFBC, sampler); `robustBufferAccess2`
+  liga o `robustBufferAccess` do core. Também em templates, push descriptors e vertex buffers nulos.
+  Limite: escrita em storage nulo vai para o fantasma (deveria ser descartada); view fantasma de
+  imagem é 2D quando o tipo do shader não é conhecido.
+- `VK_KHR_push_descriptor` (+ templates e as versões 2 do maintenance6): descriptor sets de pools
+  por command buffer, zerados no `vkBeginCommandBuffer`.
+- `VK_EXT_vertex_attribute_divisor`: apelido do KHR do driver.
+- `VK_EXT_depth_clip_enable`: corte desligado = depthClamp exato; ligado = sem clamp (sem custo).
+- `VK_EXT_memory_budget` (uso contado pelo vkshim + 80% da RAM livre), `VK_EXT_memory_priority` e
+  `VK_EXT_pageable_device_local_memory` (aceitos e ignorados).
+- `VK_EXT_multi_draw`: laço de draws com `gl_DrawID` = índice.
+- Achado: o r49 trava (SIGSEGV) em `vkUpdateDescriptorSets` com qualquer handle nulo.
+
+### v4.9 — medição e config por jogo
+- HUD (`hud=1`): CSV por segundo em `Android/data/<pkg>/vkshim_hud.csv` + logcat a cada 5 s:
+  fps, quadro (mediana/p95/pior), espera pela GPU, latência de submit, submits/draws por quadro,
+  pipelines compilados, MHz/uso da GPU (ged) e temperatura. `vkshim-hud <pkg> [resumo]`.
+- O timestamp do r49 na G76 não é contínuo entre submits: não serve para tempo ocupado da GPU
+  (a espera da CPU é o indicador de limite de GPU).
+- Config por jogo: `Android/data/<pkg>/vkshim.conf` (chave=valor; props `debug.vkshim.*` ganham).
+  `vkshim-conf <pkg> set k=v`. Ferramentas em `/system/bin` do módulo.
+- Módulo: `sepolicy.rule` + `service.sh` (`chmod 0444` no ged) para o HUD ler a GPU de dentro do app.
+
+### v4.8 — correções
+- depthClamp exato por pixel (`gl_FragDepth`); `debug.vkshim.clamp` 0/1/2. Corrige o chão
+  transparente perto da câmera no BT3 (Dragon Rage). e47 `clamp_chao` lê a profundidade:
+  v4.7 erro 0,77 em 100% dos pixels, v4.8 erro 0.
+- PixelBC aprendido por jogo (`cache/vkshim_bc.txt`): 3 sessões sem textura BC = sem PixelBC.
+- Log por pipeline no modo debug.
+
 ## v4.7 — 2026-11-26
 
 **Recursos que deixam de ser só anunciados** (testados na GPU com `tools/probe/e47`: v4 9/19, v4.7 19/19)

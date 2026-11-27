@@ -1,4 +1,4 @@
-# Roadmap v5.0 — de "compatível" para "liso"
+# Roadmap — de "compatível" (v5.0) para "liso" (v5.7)
 
 Escrito em 2026-11-27, depois do primeiro teste em jogo real com a v4.7 (Dragon Rage / BT3).
 
@@ -82,8 +82,11 @@ Com isso dá para separar **GPU-bound × CPU-bound × stutter de shader × throt
 - **Q2** O probe `e47` cresce com um caso para cada bug achado em jogo (o chão do BT3 vira `clamp_cruza_near`).
 - **Q3** Os dois zips (KSU e portátil) saem do mesmo commit, com o mesmo número de versão.
 
-## 5. Ordem sugerida
+## 5. Ordem
 
-1. **v4.8 (correção):** P0.1 depthClamp exato, P1.5 PixelBC preguiçoso, caso novo no e47, teste no BT3.
-2. **v4.9 (medição):** P0.2 HUD, U2 config por pacote. Medir BT3/FH4/COD4 e registrar os números.
-3. **v5.0 (desempenho):** P1.1 limitador, P1.4 samplers, P1.3 fp16 experimental e P1.2 escala (se a prova de conceito passar), perfis U4, integração com o Game Mode, matriz Q1. Release dos dois zips.
+1. ✅ **v4.8:** depthClamp exato (P0.1), PixelBC aprendido por jogo (P1.5), `clamp_chao` no e47.
+2. ✅ **v4.9:** HUD (P0.2), config por pacote (U2), sepolicy/chmod do ged no módulo.
+3. ✅ **v4.9.2–4.9.4:** robustness2, push descriptor, descriptor indexing completo, draw_indirect_count,
+   depth_clip_enable/control, multi draw, memory budget. **Lançado como v5.0 (2026-11-27).**
+4. **v5.7 (desempenho):** P1.1 limitador, P1.4 samplers, P1.3 fp16 experimental e P1.2 escala (se a
+   prova de conceito passar), perfis U4, integração com o Game Mode, matriz Q1.

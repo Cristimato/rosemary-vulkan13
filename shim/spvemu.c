@@ -136,7 +136,10 @@ static uint32_t ed_id(Ed *e) { return e->bound++; }
 
 /* devolve o id de um tipo/constante com estes operandos; cria antes da 1ª função se não existir.
  * res_at: posição do id de resultado (1 = tipos, 2 = constantes). */
-static uint32_t ed_find(Ed *e, uint32_t op, int res_at, const uint32_t *a, uint32_t na) {
+static uint32_t ed_find_at(Ed *e, uint32_t op, int res_at, const uint32_t *a, uint32_t na, uint32_t at);
+static uint32_t ed_find(Ed *e, uint32_t op, int res_at, const uint32_t *a, uint32_t na) { return ed_find_at(e, op, res_at, a, na, e->i_func); }
+/* como ed_find, mas um tipo/constante novo é declarado antes da instrução 'at' */
+static uint32_t ed_find_at(Ed *e, uint32_t op, int res_at, const uint32_t *a, uint32_t na, uint32_t at) {
     for (uint32_t i = 0; i < e->i_func; i++) {
         const uint32_t *w = I(e, i);
         if (OP(w[0]) != op || WC(w[0]) != na + 2) continue;
@@ -149,7 +152,7 @@ static uint32_t ed_find(Ed *e, uint32_t op, int res_at, const uint32_t *a, uint3
         p += 3 + an;
     }
     uint32_t id = ed_id(e);
-    Buf *b = &e->pre[e->i_func];
+    Buf *b = &e->pre[at];
     bput(b, ((na + 2) << 16) | op);
     if (res_at == 1) { bput(b, id); for (uint32_t i = 0; i < na; i++) bput(b, a[i]); }
     else { bput(b, a[0]); bput(b, id); for (uint32_t i = 1; i < na; i++) bput(b, a[i]); }
@@ -484,17 +487,102 @@ static int do_clamp(Ed *e) {
     return nends ? 1 : -1;
 }
 
-/* ------------------------------------------------------------------ gl_DrawID -> push constant */
-static int do_drawid(Ed *e, int off) {
+/* ------------------------------------------------------------------ depthClamp exato (v4.8)
+ * Último estágio: (z, w) de clip vão numa varying vec2 (interpolação perspective-correct dá o z/w
+ * real em cada pixel) e gl_Position.z vira 0.5*w, que fica sempre entre 0 e w: nada é cortado no
+ * near/far, e o recorte que sobra é o de w > 0 (plano do olho), como no depthClamp de verdade.
+ * O fragment shader (spvemu_fs_clamp) grava gl_FragDepth = clamp(z/w) por pixel. */
+static uint32_t t_vec2(Ed *e) { uint32_t a[] = { t_float(e), 2 }; return ed_find(e, 23, 1, a, 2); }
+
+static int do_clamp_exact(Ed *e, int loc) {
+    BOut b;
+    if (!find_builtin_out(e, B_POSITION, &b)) return 0;
+    uint32_t v4 = t_vec4(e), ft = t_float(e), v2 = t_vec2(e);
+    if (b.type != v4) return -1;
+    uint32_t pov = t_ptr(e, SC_OUTPUT, v4), pv2 = t_ptr(e, SC_OUTPUT, v2), half = c_float(e, 0.5f);
+    uint32_t mi = b.member >= 0 ? c_int(e, b.member) : 0;
+    uint32_t out = ed_id(e);
+    EMIT(&e->pre[e->i_func], 59, pv2, out, SC_OUTPUT);
+    EMIT(&e->pre[e->i_annot_end], 71, out, D_LOCATION, (uint32_t)loc);
+    ed_iface_add(e, &out, 1);
+    int nends = 0;
+    for (uint32_t i = e->i_func; i < e->ni; i++) {
+        if (!is_vertex_end(e, i)) continue;
+        nends++;
+        Buf *p = &e->pre[i];
+        uint32_t ptr = b.var;
+        if (b.member >= 0) { ptr = ed_id(e); EMIT(p, 65, pov, ptr, b.var, mi); }
+        uint32_t v = ed_id(e), z = ed_id(e), w = ed_id(e), zw = ed_id(e), hz = ed_id(e), v2b = ed_id(e);
+        EMIT(p, 61, v4, v, ptr);
+        EMIT(p, 81, ft, z, v, 2);
+        EMIT(p, 81, ft, w, v, 3);
+        EMIT(p, 80, v2, zw, z, w);
+        EMIT(p, 62, out, zw);
+        EMIT(p, 133, ft, hz, w, half);
+        EMIT(p, 82, v4, v2b, hz, v, 2);
+        EMIT(p, 62, ptr, v2b);
+    }
+    return nends ? 1 : -1;
+}
+
+/* ------------------------------------------------------------------ depth_clip_control (v4.9.4)
+ * negativeOneToOne: o app escreve z em [-w, w] (convenção do OpenGL); vira (z + w) / 2. */
+static int do_negz(Ed *e) {
+    BOut b;
+    if (!find_builtin_out(e, B_POSITION, &b)) return 0;
+    uint32_t v4 = t_vec4(e), ft = t_float(e);
+    if (b.type != v4) return -1;
+    uint32_t pov = t_ptr(e, SC_OUTPUT, v4), half = c_float(e, 0.5f);
+    uint32_t mi = b.member >= 0 ? c_int(e, b.member) : 0;
+    int nends = 0;
+    for (uint32_t i = e->i_func; i < e->ni; i++) {
+        if (!is_vertex_end(e, i)) continue;
+        nends++;
+        Buf *p = &e->pre[i];
+        uint32_t ptr = b.var;
+        if (b.member >= 0) { ptr = ed_id(e); EMIT(p, 65, pov, ptr, b.var, mi); }
+        uint32_t v = ed_id(e), z = ed_id(e), w = ed_id(e), s_ = ed_id(e), h = ed_id(e), v2 = ed_id(e);
+        EMIT(p, 61, v4, v, ptr);
+        EMIT(p, 81, ft, z, v, 2);
+        EMIT(p, 81, ft, w, v, 3);
+        EMIT(p, 129, ft, s_, z, w);
+        EMIT(p, 133, ft, h, s_, half);
+        EMIT(p, 82, v4, v2, h, v, 2);
+        EMIT(p, 62, ptr, v2);
+    }
+    return nends ? 1 : -1;
+}
+
+/* ------------------------------------------------------------------ push constants do vkshim
+ * gl_DrawID (v4.7) e draw_indirect_count (v4.9.4) num bloco de push constant só:
+ *   off : int com o índice do draw (o vkshim grava antes de cada draw)
+ *   off8: uvec2 com o endereço (buffer device address) do contador; 0 = draw comum.
+ * Com off8, no fim do vertex shader: se endereço != 0 e índice >= *endereço, o vértice vai para
+ * fora da tela (o draw some). */
+static uint32_t t_uint(Ed *e) { uint32_t a[] = { 32, 0 }; return ed_find(e, 21, 1, a, 2); }
+static uint32_t c_uint(Ed *e, uint32_t v) { uint32_t a[] = { t_uint(e), v }; return ed_find(e, 43, 2, a, 2); }
+
+static int do_pc(Ed *e, int off, int off8) {
     uint32_t dvar = 0, it = 0;
     const uint32_t *ep = I(e, e->ep_i);
     for (uint32_t k = e->ep_iface; k < WC(ep[0]); k++) {
         const uint32_t *v = defw(e, ep[k]);
         if (v && OP(v[0]) == 59 && v[3] == SC_INPUT && var_builtin(e, ep[k]) == B_DRAWINDEX) { dvar = ep[k]; it = ptr_pointee(e, v[1]); }
     }
-    if (!dvar) return 0;
-    const uint32_t *itw = defw(e, it);
-    if (!itw || OP(itw[0]) != 21 || itw[2] != 32) return -1;
+    int need_cnt = off8 >= 0 && e->ep_model == 0;
+    if (!dvar && !need_cnt) return 0;
+    /* bloco de push constant existente: os tipos dos membros novos são declarados antes dele */
+    uint32_t pv0 = 0, st0 = 0;
+    for (uint32_t i = 0; i < e->i_func; i++) { const uint32_t *w = I(e, i); if (OP(w[0]) == 59 && WC(w[0]) >= 4 && w[3] == SC_PUSH) { pv0 = w[2]; st0 = ptr_pointee(e, w[1]); } }
+    uint32_t tat = (pv0 && st0 < e->bound0 && e->def[st0]) ? e->def[st0] : e->i_func;
+    if (dvar) { const uint32_t *itw = defw(e, it); if (!itw || OP(itw[0]) != 21 || itw[2] != 32) return -1; }
+    else { uint32_t a[] = { 32, 1 }; it = ed_find_at(e, 21, 1, a, 2, tat); }
+    BOut pos;
+    if (need_cnt && (!find_builtin_out(e, B_POSITION, &pos) || pos.type != t_vec4(e))) need_cnt = 0;
+    if (!dvar && !need_cnt) return 0;
+    uint32_t tu, tuv2 = 0;
+    { uint32_t a[] = { 32, 0 }; tu = ed_find_at(e, 21, 1, a, 2, tat); }
+    if (need_cnt) { uint32_t a[] = { tu, 2 }; tuv2 = ed_find_at(e, 23, 1, a, 2, tat); }
     /* bloco de push constant existente (no máximo um por entry point) */
     uint32_t pvar = 0, st = 0;
     for (uint32_t i = 0; i < e->i_func; i++) {
@@ -504,57 +592,133 @@ static int do_drawid(Ed *e, int off) {
             pvar = w[2]; st = ptr_pointee(e, w[1]);
         }
     }
-    uint32_t member;
+    uint32_t mdid, maddr = 0;
     if (pvar) {
         const uint32_t *sw = defw(e, st);
         if (!sw || OP(sw[0]) != 30) return -1;
         uint32_t wc = WC(sw[0]);
-        member = wc - 2;
         uint32_t r[64];
-        if (wc + 1 > 64) return -1;
-        memcpy(r, sw, wc * 4); r[wc] = it; r[0] = ((wc + 1) << 16) | 30;
-        ed_set_rep(e, e->def[st], r, wc + 1);
-        EMIT(&e->pre[e->i_annot_end], 72, st, member, D_OFFSET, (uint32_t)off);
+        if (wc + 2 > 64) return -1;
+        memcpy(r, sw, wc * 4);
+        mdid = wc - 2; r[wc] = it;
+        uint32_t nwc = wc + 1;
+        if (need_cnt) { maddr = wc - 1; r[nwc++] = tuv2; }
+        r[0] = (nwc << 16) | 30;
+        ed_set_rep(e, e->def[st], r, nwc);
+        EMIT(&e->pre[e->i_annot_end], 72, st, mdid, D_OFFSET, (uint32_t)off);
+        if (need_cnt) EMIT(&e->pre[e->i_annot_end], 72, st, maddr, D_OFFSET, (uint32_t)off8);
     } else {
-        st = ed_id(e); member = 0;
-        EMIT(&e->pre[e->i_func], 30, st, it);
+        st = ed_id(e); mdid = 0;
+        if (need_cnt) { maddr = 1; EMIT(&e->pre[e->i_func], 30, st, it, tuv2); }
+        else EMIT(&e->pre[e->i_func], 30, st, it);
         EMIT(&e->pre[e->i_annot_end], 71, st, D_BLOCK);
         EMIT(&e->pre[e->i_annot_end], 72, st, 0, D_OFFSET, (uint32_t)off);
+        if (need_cnt) EMIT(&e->pre[e->i_annot_end], 72, st, 1, D_OFFSET, (uint32_t)off8);
         uint32_t pt = ed_id(e);   /* ponteiro novo para o struct novo */
         EMIT(&e->pre[e->i_func], 32, pt, SC_PUSH, st);
         pvar = ed_id(e);
         EMIT(&e->pre[e->i_func], 59, pt, pvar, SC_PUSH);
         if (e->version >= 0x00010400) ed_iface_add(e, &pvar, 1);
     }
-    uint32_t ppi = t_ptr(e, SC_PUSH, it), mc = c_int(e, (int32_t)member);
+    uint32_t ppi = t_ptr(e, SC_PUSH, it), mc = c_int(e, (int32_t)mdid);
     int n = 0;
-    for (uint32_t i = e->i_func; i < e->ni; i++) {
-        const uint32_t *w = I(e, i); uint32_t op = OP(w[0]), wc = WC(w[0]);
-        if (op == 61 && wc >= 4 && w[3] == dvar) {
-            uint32_t ac = ed_id(e);
-            Buf r = { 0 };
-            EMIT(&r, 65, ppi, ac, pvar, mc);
-            EMIT(&r, 61, w[1], w[2], ac);
-            ed_set_rep(e, i, r.w, (uint32_t)r.n); free(r.w);
-            n++;
-            continue;
+    if (dvar)
+        for (uint32_t i = e->i_func; i < e->ni; i++) {
+            const uint32_t *w = I(e, i); uint32_t op = OP(w[0]), wc = WC(w[0]);
+            if (op == 61 && wc >= 4 && w[3] == dvar) {
+                uint32_t ac = ed_id(e);
+                Buf r = { 0 };
+                EMIT(&r, 65, ppi, ac, pvar, mc);
+                EMIT(&r, 61, w[1], w[2], ac);
+                ed_set_rep(e, i, r.w, (uint32_t)r.n); free(r.w);
+                n++;
+                continue;
+            }
+            if (op == 8 || op == 317) continue;
+            for (uint32_t k = 1; k < wc; k++) if (w[k] == dvar) return -1;
         }
-        if (op == 8 || op == 317) continue;
-        for (uint32_t k = 1; k < wc; k++) if (w[k] == dvar) return -1;
+    if (need_cnt) {
+        uint32_t bt = t_bool(e), v4 = t_vec4(e), ft = t_float(e);
+        uint32_t tul = 0; { uint32_t a[] = { 64, 0 }; tul = ed_find(e, 21, 1, a, 2); }
+        uint32_t ppsb = t_ptr(e, 5349, tu), ppa = t_ptr(e, SC_PUSH, tuv2), pov = t_ptr(e, SC_OUTPUT, v4);
+        uint32_t cma = c_int(e, (int32_t)maddr), cu0 = c_uint(e, 0), c2 = c_float(e, 2.0f), c1 = c_float(e, 1.0f);
+        uint32_t fora; { uint32_t a[] = { v4, c2, c2, c2, c1 }; fora = ed_find(e, 44, 2, a, 5); }
+        uint32_t pmi = pos.member >= 0 ? c_int(e, pos.member) : 0;
+        int nends = 0;
+        for (uint32_t i = e->i_func; i < e->ni; i++) {
+            if (!is_vertex_end(e, i)) continue;
+            nends++;
+            Buf *p = &e->pre[i];
+            uint32_t pa = ed_id(e), a = ed_id(e), ax = ed_id(e), ay = ed_id(e), or_ = ed_id(e), nz = ed_id(e);
+            uint32_t Lt = ed_id(e), Lm = ed_id(e), Lk = ed_id(e), Lm2 = ed_id(e);
+            EMIT(p, 65, ppa, pa, pvar, cma);
+            EMIT(p, 61, tuv2, a, pa);
+            EMIT(p, 81, tu, ax, a, 0);
+            EMIT(p, 81, tu, ay, a, 1);
+            EMIT(p, 197, tu, or_, ax, ay);                 /* OpBitwiseOr */
+            EMIT(p, 171, bt, nz, or_, cu0);                /* OpINotEqual */
+            EMIT(p, 247, Lm, 0);
+            EMIT(p, 250, nz, Lt, Lm);
+            EMIT(p, 248, Lt);
+            uint32_t u64 = ed_id(e), ptr = ed_id(e), cnt = ed_id(e), pd = ed_id(e), d = ed_id(e), du = ed_id(e), dead = ed_id(e);
+            EMIT(p, 124, tul, u64, a);                     /* OpBitcast uvec2 -> u64 */
+            EMIT(p, 120, ppsb, ptr, u64);                  /* OpConvertUToPtr */
+            EMIT(p, 61, tu, cnt, ptr, 2, 4);               /* Load Aligned 4 */
+            EMIT(p, 65, ppi, pd, pvar, mc);
+            EMIT(p, 61, it, d, pd);
+            EMIT(p, 124, tu, du, d);
+            EMIT(p, 174, bt, dead, du, cnt);               /* OpUGreaterThanEqual */
+            EMIT(p, 247, Lm2, 0);
+            EMIT(p, 250, dead, Lk, Lm2);
+            EMIT(p, 248, Lk);
+            uint32_t pp = pos.var;
+            if (pos.member >= 0) { pp = ed_id(e); EMIT(p, 65, pov, pp, pos.var, pmi); }
+            EMIT(p, 62, pp, fora);
+            EMIT(p, 249, Lm2);
+            EMIT(p, 248, Lm2);
+            EMIT(p, 249, Lm);
+            EMIT(p, 248, Lm);
+        }
+        (void)ft;
+        if (!nends) return -1;
+        /* Int64 + PhysicalStorageBufferAddresses, modelo de endereçamento e extensão */
+        int h11 = 0, h5347 = 0, hext = 0; uint32_t first_non_cap = 0, mm = 0;
+        for (uint32_t i = 0; i < e->i_func; i++) {
+            const uint32_t *x = I(e, i);
+            if (OP(x[0]) == 17) { if (x[1] == 11) h11 = 1; if (x[1] == 5347) h5347 = 1; }
+            else if (!first_non_cap) first_non_cap = i;
+            if (OP(x[0]) == 10 && strstr((const char *)&x[1], "physical_storage_buffer")) hext = 1;
+            if (OP(x[0]) == 14) mm = i;
+        }
+        if (!h11) EMIT(&e->pre[0], 17, 11);
+        if (!h5347) EMIT(&e->pre[0], 17, 5347);
+        if (!hext && e->version < 0x00010500 && first_non_cap) {
+            static const char nm[] = "SPV_KHR_physical_storage_buffer";
+            uint32_t wd[9] = { 0 }; memcpy(wd, nm, sizeof nm);
+            binst(&e->pre[first_non_cap], 10, wd, (uint32_t)((sizeof nm + 3) / 4));
+        }
+        if (mm) { const uint32_t *x = I(e, mm); if (x[1] == 0) { uint32_t r[3] = { (3u << 16) | 14, 5348, x[2] }; ed_set_rep(e, mm, r, 3); } else if (x[1] != 5348) return -1; }
+        n++;
     }
     return n ? 1 : 0;
 }
 
-uint32_t *spvemu_prerast(const uint32_t *w, size_t nw, const char *entry, int clip_loc, int clamp,
-                         int drawid_off, size_t *out_nw, int *clip_nvec, unsigned *done) {
+uint32_t *spvemu_prerast2(const uint32_t *w, size_t nw, const char *entry, int clip_loc, int clamp,
+                          int drawid_off, int count_off8, int negz, size_t *out_nw, int *clip_nvec, unsigned *done) {
     *done = 0; *clip_nvec = 0;
     Ed e;
     oom = 0;
     if (ed_init(&e, w, nw, entry)) return NULL;
     if (e.ep_model > 3 || e.ep_model == 1) { ed_free(&e); return NULL; }
     if (clip_loc >= 0) { int r = do_clip(&e, clip_loc, clip_nvec); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_CLIP; }
-    if (clamp && e.ep_model != 1) { int r = do_clamp(&e); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_CLAMP; }
-    if (drawid_off >= 0 && e.ep_model == 0) { int r = do_drawid(&e, drawid_off); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_DRAWID; }
+    if (negz) { int r = do_negz(&e); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_NEGZ; }
+    if (clamp >= SPVEMU_CLAMP_EXACT) {
+        int r = do_clamp_exact(&e, clamp - SPVEMU_CLAMP_EXACT); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_CLAMP | SPVEMU_DID_CLAMPX;
+    } else if (clamp) { int r = do_clamp(&e); if (r < 0) goto fail; if (r) *done |= SPVEMU_DID_CLAMP; }
+    if (drawid_off >= 0 && e.ep_model == 0) {
+        int r = do_pc(&e, drawid_off, count_off8); if (r < 0) goto fail;
+        if (r) *done |= SPVEMU_DID_DRAWID | (count_off8 >= 0 ? SPVEMU_DID_COUNT : 0);
+    }
     if (!*done) goto fail;
     uint32_t *out = ed_build(&e, out_nw);
     ed_free(&e);
@@ -564,6 +728,10 @@ fail:
     ed_free(&e);
     *done = 0;
     return NULL;
+}
+uint32_t *spvemu_prerast(const uint32_t *w, size_t nw, const char *entry, int clip_loc, int clamp,
+                         int drawid_off, size_t *out_nw, int *clip_nvec, unsigned *done) {
+    return spvemu_prerast2(w, nw, entry, clip_loc, clamp, drawid_off, -1, 0, out_nw, clip_nvec, done);
 }
 
 /* ------------------------------------------------------------------ fragment shader */
@@ -670,6 +838,166 @@ uint32_t *spvemu_fs_new(int loc, int nvec, size_t *out_nw) {
     b.w[3] = id;
     *out_nw = b.n;
     return b.w;
+}
+
+/* ------------------------------------------------------------------ depthClamp exato: fragment shader
+ * Lê a varying (z, w) em loc e calcula d = clamp(minD + z/w*(maxD-minD)). Se o shader não grava
+ * gl_FragDepth, passa a gravar d (DepthReplacing). Se grava, cada escrita é grampeada no intervalo.
+ * Leituras de gl_FragCoord passam a ver z = d (o z rasterizado virou a constante 0.5). */
+static int find_builtin_var(const Ed *e, uint32_t sc, uint32_t builtin, uint32_t *ptr_t) {
+    const uint32_t *ep = I(e, e->ep_i);
+    for (uint32_t k = e->ep_iface; k < WC(ep[0]); k++) {
+        const uint32_t *v = defw(e, ep[k]);
+        if (!v || OP(v[0]) != 59 || v[3] != sc) continue;
+        if (var_builtin(e, ep[k]) == (int)builtin) { if (ptr_t) *ptr_t = v[1]; return (int)ep[k]; }
+        const uint32_t *st = defw(e, ptr_pointee(e, v[1]));
+        if (st && OP(st[0]) == 30 && member_builtin(e, ptr_pointee(e, v[1]), builtin) >= 0) return -1;   /* em bloco: não suportado */
+    }
+    return 0;
+}
+
+/* clamp por comparação + OpSelect (min/max com 0 cai na errata Arm 3779215) */
+static uint32_t emit_clamp(Ed *e, Buf *p, uint32_t x, uint32_t lo, uint32_t hi) {
+    uint32_t ft = t_float(e), bt = t_bool(e);
+    uint32_t c1 = ed_id(e), s1 = ed_id(e), c2 = ed_id(e), s2 = ed_id(e);
+    EMIT(p, 184, bt, c1, x, lo);
+    EMIT(p, 169, ft, s1, c1, lo, x);
+    EMIT(p, 186, bt, c2, s1, hi);
+    EMIT(p, 169, ft, s2, c2, hi, s1);
+    return s2;
+}
+
+uint32_t *spvemu_fs_clamp(const uint32_t *w, size_t nw, const char *entry, int loc, float mind, float maxd, size_t *out_nw) {
+    Ed e;
+    oom = 0;
+    if (loc < 0 || ed_init(&e, w, nw, entry)) return NULL;
+    if (e.ep_model != 4) goto fail;
+    /* EarlyFragmentTests ignora gl_FragDepth; DepthGreater/Less/Unchanged prometem algo que deixa de valer */
+    uint32_t last_ep = e.ep_i;
+    for (uint32_t i = 0; i < e.i_annot_end; i++) {
+        const uint32_t *x = I(&e, i);
+        if (OP(x[0]) == 15) last_ep = i;
+        if (OP(x[0]) == 16 && WC(x[0]) >= 3 && x[1] == e.ep_fn && (x[2] == 9 || x[2] == 14 || x[2] == 15 || x[2] == 16)) goto fail;
+    }
+    uint32_t fd_pt = 0, fc_pt = 0;
+    int fdv = find_builtin_var(&e, SC_OUTPUT, 22, &fd_pt);
+    int fcv = find_builtin_var(&e, SC_INPUT, 15, &fc_pt);
+    if (fdv < 0 || fcv < 0) goto fail;
+    uint32_t ft = t_float(&e), v2 = t_vec2(&e), v4 = t_vec4(&e);
+    if (fcv && ptr_pointee(&e, fc_pt) != v4) goto fail;
+    if (fdv && ptr_pointee(&e, fd_pt) != ft) goto fail;
+    float lo_f = mind < maxd ? mind : maxd, hi_f = mind < maxd ? maxd : mind;
+    uint32_t lo = c_float(&e, lo_f), hi = c_float(&e, hi_f);
+    uint32_t pf_priv = t_ptr(&e, SC_PRIVATE, ft);
+
+    /* entrada (z, w) */
+    uint32_t in = ed_id(&e);
+    EMIT(&e.pre[e.i_func], 59, t_ptr(&e, SC_INPUT, v2), in, SC_INPUT);
+    EMIT(&e.pre[e.i_annot_end], 71, in, D_LOCATION, (uint32_t)loc);
+    ed_iface_add(&e, &in, 1);
+    /* profundidade grampeada guardada numa Private (as escritas podem estar em outras funções) */
+    uint32_t dzp = ed_id(&e);
+    EMIT(&e.pre[e.i_func], 59, pf_priv, dzp, SC_PRIVATE);
+    if (e.version >= 0x00010400) ed_iface_add(&e, &dzp, 1);
+    uint32_t fcp = 0;
+    if (fcv) {
+        fcp = ed_id(&e);
+        EMIT(&e.pre[e.i_func], 59, t_ptr(&e, SC_PRIVATE, v4), fcp, SC_PRIVATE);
+        if (e.version >= 0x00010400) ed_iface_add(&e, &fcp, 1);
+    }
+    uint32_t fdo = (uint32_t)fdv;
+    if (!fdv) {
+        fdo = ed_id(&e);
+        EMIT(&e.pre[e.i_func], 59, t_ptr(&e, SC_OUTPUT, ft), fdo, SC_OUTPUT);
+        EMIT(&e.pre[e.i_annot_end], 71, fdo, D_BUILTIN, 22);
+        EMIT(&e.pre[last_ep + 1], 16, e.ep_fn, 12);              /* DepthReplacing */
+        ed_iface_add(&e, &fdo, 1);
+    }
+
+    /* usos do gl_FragCoord e escritas do gl_FragDepth no código original */
+    for (uint32_t i = e.i_func; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (op == 8 || op == 317) continue;
+        if (fcv) {
+            if (op == 61 && wc >= 4 && x[3] == (uint32_t)fcv) {
+                uint32_t r[16]; if (wc > 16) goto fail;
+                memcpy(r, x, wc * 4); r[3] = fcp; ed_set_rep(&e, i, r, wc); continue;
+            }
+            if ((op == 65 || op == 66) && wc >= 4 && x[3] == (uint32_t)fcv) {
+                uint32_t pt = ptr_pointee(&e, x[1]);
+                uint32_t r[16]; if (!pt || wc > 16) goto fail;
+                memcpy(r, x, wc * 4); r[1] = t_ptr(&e, SC_PRIVATE, pt); r[3] = fcp; ed_set_rep(&e, i, r, wc); continue;
+            }
+        }
+        if (fdv && op == 62 && wc >= 3 && x[1] == (uint32_t)fdv) {
+            Buf r = { 0 };
+            uint32_t c = emit_clamp(&e, &r, x[2], lo, hi);
+            EMIT(&r, 62, (uint32_t)fdv, c);
+            ed_set_rep(&e, i, r.w, (uint32_t)r.n); free(r.w);
+            continue;
+        }
+        if (fdv && op == 61 && wc >= 4 && x[3] == (uint32_t)fdv) continue;
+        for (uint32_t k = 1; k < wc; k++)
+            if ((fcv && x[k] == (uint32_t)fcv) || (fdv && x[k] == (uint32_t)fdv)) goto fail;
+    }
+
+    /* começo do main, depois das OpVariable do 1º bloco */
+    uint32_t at = e.fn_begin + 1;
+    while (at < e.fn_end && OP(I(&e, at)[0]) != 248) at++;
+    at++;
+    while (at < e.fn_end) { uint32_t op = OP(I(&e, at)[0]); if (op != 59 && op != 8 && op != 317) break; at++; }
+    if (at >= e.fn_end) goto fail;
+    Buf *p = &e.pre[at];
+    uint32_t a = ed_id(&e), z = ed_id(&e), ww = ed_id(&e), d = ed_id(&e);
+    EMIT(p, 61, v2, a, in);
+    EMIT(p, 81, ft, z, a, 0);
+    EMIT(p, 81, ft, ww, a, 1);
+    EMIT(p, 136, ft, d, z, ww);
+    if (mind != 0.0f || maxd != 1.0f) {
+        uint32_t m = ed_id(&e), s = ed_id(&e);
+        EMIT(p, 133, ft, m, d, c_float(&e, maxd - mind));
+        EMIT(p, 129, ft, s, m, c_float(&e, mind));
+        d = s;
+    }
+    uint32_t dz = emit_clamp(&e, p, d, lo, hi);
+    EMIT(p, 62, dzp, dz);
+    if (!fdv) EMIT(p, 62, fdo, dz);
+    if (fcv) {
+        uint32_t f = ed_id(&e), f2 = ed_id(&e);
+        EMIT(p, 61, v4, f, (uint32_t)fcv);
+        EMIT(p, 82, v4, f2, dz, f, 2);
+        EMIT(p, 62, fcp, f2);
+    }
+    uint32_t *out = ed_build(&e, out_nw);
+    ed_free(&e);
+    return out;
+fail:
+    ed_free(&e);
+    return NULL;
+}
+
+/* FS mínimo só com a profundidade (pipeline sem fragment shader e sem escrita de cor) */
+uint32_t *spvemu_fs_depth_new(int loc, float mind, float maxd, size_t *out_nw) {
+    enum { VOID = 1, FNT, MAIN, L0, NEXT };
+    Buf b = { 0 };
+    oom = 0;
+    bput(&b, 0x07230203); bput(&b, 0x00010000); bput(&b, 0); bput(&b, NEXT); bput(&b, 0);
+    EMIT(&b, 17, 1);
+    EMIT(&b, 14, 0, 1);
+    EMIT(&b, 15, 4, MAIN, 0x6e69616d, 0);
+    EMIT(&b, 16, MAIN, 7);
+    EMIT(&b, 19, VOID);
+    EMIT(&b, 33, FNT, VOID);
+    EMIT(&b, 54, VOID, MAIN, 0, FNT);
+    EMIT(&b, 248, L0);
+    EMIT(&b, 253);
+    EMIT(&b, 56);
+    if (oom) { free(b.w); return NULL; }
+    size_t n;
+    uint32_t *r = spvemu_fs_clamp(b.w, b.n, "main", loc, mind, maxd, &n);
+    free(b.w);
+    if (r) *out_nw = n;
+    return r;
 }
 
 /* ------------------------------------------------------------------ fillModeNonSolid por geometry shader
@@ -907,4 +1235,281 @@ done:
     free(hd.w); free(dc.w); free(ty.w); free(fn.w); free(caps.w); free(map);
     ed_free(&e);
     return out;
+}
+
+/* ------------------------------------------------------------------ índice não uniforme de imagens (v4.9.3)
+ * A G76 usa o índice de uma thread só quando um array de imagens/samplers é indexado com valores
+ * diferentes no mesmo warp. Para cada operação de imagem cujo descritor vem de um OpAccessChain
+ * decorado NonUniform (no índice, na cadeia ou no load), a operação vai para um laço "waterfall":
+ *   repete N vezes: se a thread ainda não terminou, f = broadcastFirst(índice) entre as que faltam,
+ *   busca com t[f] (uniforme) e guarda o resultado se índice == f.
+ * A busca fica fora do if (índice == f): dentro dele o compilador troca t[f] por t[índice].
+ * Em fragment shader, ImplicitLod vira ExplicitLod com gradientes calculados antes do laço. */
+#define WF_MAXUSE 8
+static int is_img_op(uint32_t op) { return (op >= 87 && op <= 99) || (op >= 103 && op <= 107) || op == 100; }
+static int img_mask_pos(uint32_t op) {   /* posição da máscara ImageOperands (0 = não tem) */
+    switch (op) {
+    case 87: case 88: case 91: case 92: case 95: case 98: return 5;
+    case 89: case 90: case 93: case 94: case 96: case 97: return 6;
+    case 99: return 4;
+    }
+    return 0;
+}
+static int imgop_nargs(uint32_t bit) {
+    switch (bit) { case 0x1: case 0x2: case 0x8: case 0x10: case 0x20: case 0x40: case 0x80: case 0x100: case 0x200: return 1; case 0x4: return 2; }
+    if (bit == 0x400 || bit == 0x800 || bit == 0x1000 || bit == 0x2000 || bit == 0x10000) return 0;
+    return -1;
+}
+
+typedef struct { uint32_t *res_at; } WfDefs;
+
+int spvemu_waterfall_needed(const uint32_t *w, size_t nw) {
+    for (size_t i = 5; i < nw;) {
+        uint32_t wc = WC(w[i]); if (!wc) return 0;
+        if (OP(w[i]) == 71 && wc >= 3 && w[i + 2] == 5300) return 1;
+        i += wc;
+    }
+    return 0;
+}
+
+uint32_t *spvemu_waterfall(const uint32_t *w, size_t nw, int iters, size_t *out_nw, int *count) {
+    *count = 0;
+    Ed e;
+    oom = 0;
+    if (ed_init(&e, w, nw, NULL)) return NULL;
+    uint32_t bound0 = e.bound0;
+    /* id -> instrução que o define (qualquer opcode com resultado em w[2]) e decorações NonUniform */
+    uint32_t *defi = calloc(bound0, 4);
+    uint8_t *nonu = calloc(bound0, 1);
+    uint32_t *lab_final = calloc(bound0, 4);      /* rótulo de bloco -> rótulo do último pedaço depois de dividir */
+    uint8_t *is_frag = NULL;
+    if (!defi || !nonu || !lab_final) goto fail;
+    for (uint32_t i = 0; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (op == 71 && wc >= 3 && x[2] == 5300 && x[1] < bound0) nonu[x[1]] = 1;
+        if (i >= e.i_func && wc >= 3 && (op == 61 || op == 65 || op == 66 || op == 86 || is_img_op(op) || op == 60) && x[2] < bound0) defi[x[2]] = i;
+        if (op == 59 && wc >= 4 && x[2] < bound0) defi[x[2]] = i;
+    }
+    /* modelo: só converte ImplicitLod se TODOS os entry points são fragment */
+    int all_frag = 1;
+    for (uint32_t i = 0; i < e.i_func; i++) { const uint32_t *x = I(&e, i); if (OP(x[0]) == 15 && x[1] != 4) all_frag = 0; }
+    uint32_t bt = t_bool(&e), it = t_int(&e);
+    uint32_t c0 = c_int(&e, 0), c1 = c_int(&e, 1), cN = c_int(&e, iters), cScope = c_int(&e, 3);
+    uint32_t cT = 0, cF = 0;
+    { uint32_t a[] = { bt }; cT = ed_find(&e, 41, 2, a, 1); cF = ed_find(&e, 42, 2, a, 1); }
+    uint32_t pbool = t_ptr(&e, 7, bt), pint = t_ptr(&e, 7, it);
+    uint32_t cur_label = 0, fn_first_block = 0, func_start = 0;
+    int nphi_fix = 0;
+    for (uint32_t i = e.i_func; i < e.ni; i++) {
+        const uint32_t *x = I(&e, i); uint32_t op = OP(x[0]), wc = WC(x[0]);
+        if (op == 54) { func_start = i; fn_first_block = 0; continue; }
+        if (op == 248) { cur_label = x[1]; if (!fn_first_block) fn_first_block = i; if (cur_label < bound0) lab_final[cur_label] = cur_label; continue; }
+        if (!is_img_op(op) || op == 100 || !cur_label) continue;
+        /* bloco com OpLoopMerge não pode ser dividido */
+        int has_loopmerge = 0;
+        for (uint32_t k = i + 1; k < e.ni; k++) { uint32_t o2 = OP(I(&e, k)[0]); if (o2 == 246) { has_loopmerge = 1; break; } if (o2 == 248 || o2 == 56) break; }
+        if (has_loopmerge) continue;
+        /* operando de imagem/sampled image */
+        int has_res = op != 99;
+        uint32_t sio = has_res ? x[3] : x[1];
+        if (sio >= bound0 || !defi[sio]) continue;
+        const uint32_t *d = I(&e, defi[sio]);
+        uint32_t si_i = 0, ld_img = 0, ld_smp = 0, wrap_i = 0;
+        if (OP(d[0]) == 100) {          /* OpImage: imagem extraída do sampled image (texelFetch em sampler2D) */
+            wrap_i = defi[sio];
+            if (d[3] >= bound0 || !defi[d[3]]) continue;
+            d = I(&e, defi[d[3]]);
+            sio = d[2];
+        }
+        if (OP(d[0]) == 86) { si_i = defi[sio]; ld_img = d[3] < bound0 ? defi[d[3]] : 0; ld_smp = d[4] < bound0 ? defi[d[4]] : 0; }
+        else if (OP(d[0]) == 61) ld_img = defi[sio];
+        else continue;
+        /* loads vindos de access chain com índice dinâmico NonUniform */
+        uint32_t X = 0, ac_img = 0, ac_smp = 0;
+        uint32_t lds[2] = { ld_img, ld_smp }, *acs[2] = { &ac_img, &ac_smp };
+        int bad = 0;
+        for (int k = 0; k < 2; k++) {
+            if (!lds[k]) continue;
+            const uint32_t *l = I(&e, lds[k]);
+            if (OP(l[0]) != 61 || WC(l[0]) != 4 || l[3] >= bound0 || !defi[l[3]]) continue;   /* load de variável: uniforme */
+            const uint32_t *a = I(&e, defi[l[3]]);
+            if (OP(a[0]) != 65 && OP(a[0]) != 66) continue;
+            uint32_t dyn = 0; int ndyn = 0;
+            for (uint32_t q = 4; q < WC(a[0]); q++) { int ok; const_val(&e, a[q], &ok); if (!ok) { dyn = a[q]; ndyn++; } }
+            if (ndyn != 1) { if (ndyn > 1) bad = 1; continue; }
+            int marked = (dyn < bound0 && nonu[dyn]) || (a[2] < bound0 && nonu[a[2]]) || (l[2] < bound0 && nonu[l[2]]);
+            if (!marked) continue;
+            if (X && X != dyn) { bad = 1; break; }
+            X = dyn; *acs[k] = defi[l[3]];
+        }
+        if (bad || !X) continue;
+        const uint32_t *xd = defw(&e, X);   /* o tipo do índice: int ou uint de 32 bits */
+        uint32_t xt = 0;
+        if (X < bound0 && defi[X]) xt = I(&e, defi[X])[1];
+        else {
+            /* índice definido por instrução sem resultado mapeado: procura o tipo em qualquer instrução */
+            for (uint32_t k = e.i_func; k < e.ni && !xt; k++) { const uint32_t *y = I(&e, k); const uint32_t *ty; if (WC(y[0]) >= 3 && y[2] == X && (ty = defw(&e, y[1])) && OP(ty[0]) >= 19 && OP(ty[0]) <= 39) xt = y[1]; }
+        }
+        (void)xd;
+        const uint32_t *xtw = defw(&e, xt);
+        if (!xtw || OP(xtw[0]) != 21 || xtw[2] != 32) continue;
+        /* conversão de ImplicitLod (fragment) */
+        int implicit = op == 87 || op == 89, proj = op == 91 || op == 93;
+        if (proj) continue;
+        if (implicit && !all_frag) continue;
+        uint32_t mpos = img_mask_pos(op), mask = (mpos && wc > mpos) ? x[mpos] : 0;
+        if (mask & ~0x13fffu) continue;
+        int ok_mask = 1;
+        for (uint32_t bit = 1; bit && bit <= 0x10000; bit <<= 1) if ((mask & bit) && imgop_nargs(bit) < 0) ok_mask = 0;
+        if (!ok_mask) continue;
+        /* ---- monta o laço antes da instrução i ---- */
+        Buf *p = &e.pre[i];
+        uint32_t rt = has_res ? x[1] : 0, rid = has_res ? x[2] : 0;
+        uint32_t vdone = ed_id(&e), vctr = ed_id(&e), vres = 0;
+        Buf *vb = &e.pre[fn_first_block + 1];
+        EMIT(vb, 59, pbool, vdone, 7);
+        EMIT(vb, 59, pint, vctr, 7);
+        if (has_res) { vres = ed_id(&e); EMIT(vb, 59, t_ptr(&e, 7, rt), vres, 7); }
+        uint32_t dx = 0, dy = 0, coord = x[4], ct = 0;
+        if (implicit) {
+            for (uint32_t k = 0; k < e.ni && !ct; k++) { const uint32_t *y = I(&e, k); const uint32_t *ty; if (WC(y[0]) >= 3 && y[2] == coord && (ty = defw(&e, y[1])) && OP(ty[0]) >= 19 && OP(ty[0]) <= 39) ct = y[1]; }
+            if (!ct) { ct = 0; }
+        }
+        if (implicit && !ct) { /* tipo da coordenada desconhecido: desfaz (só variáveis já foram emitidas; inofensivas) */ continue; }
+        if (implicit) { dx = ed_id(&e); dy = ed_id(&e); EMIT(p, 207, ct, dx, coord); EMIT(p, 208, ct, dy, coord); }
+        uint32_t L_hdr = ed_id(&e), L_body = ed_id(&e), L_work = ed_id(&e), L_take = ed_id(&e), L_m2 = ed_id(&e),
+                 L_skip = ed_id(&e), L_cont = ed_id(&e), L_merge = ed_id(&e);
+        EMIT(p, 62, vdone, cF);
+        EMIT(p, 62, vctr, c0);
+        EMIT(p, 249, L_hdr);
+        EMIT(p, 248, L_hdr);
+        uint32_t cc = ed_id(&e), lt = ed_id(&e);
+        EMIT(p, 61, it, cc, vctr);
+        EMIT(p, 133 - 133 + 177, bt, lt, cc, cN);       /* OpSLessThan = 177 */
+        EMIT(p, 246, L_merge, L_cont, 0);
+        EMIT(p, 250, lt, L_body, L_merge);
+        EMIT(p, 248, L_body);
+        uint32_t dd = ed_id(&e), nd = ed_id(&e);
+        EMIT(p, 61, bt, dd, vdone);
+        EMIT(p, 168, bt, nd, dd);
+        EMIT(p, 247, L_skip, 0);
+        EMIT(p, 250, nd, L_work, L_skip);
+        EMIT(p, 248, L_work);
+        uint32_t f = ed_id(&e);
+        EMIT(p, 338, xt, f, cScope, X);
+        /* cópias da cadeia com f no lugar do índice */
+        uint32_t new_img = 0, new_smp = 0, new_si = 0;
+        uint32_t lsrc[2] = { ld_img, ld_smp }, asrc[2] = { ac_img, ac_smp }, *outs[2] = { &new_img, &new_smp };
+        for (int k = 0; k < 2; k++) {
+            if (!lsrc[k]) continue;
+            const uint32_t *l = I(&e, lsrc[k]);
+            if (!asrc[k]) { *outs[k] = l[2]; continue; }       /* load uniforme: reusa */
+            const uint32_t *a = I(&e, asrc[k]);
+            uint32_t na = ed_id(&e), nl = ed_id(&e);
+            bput(p, (WC(a[0]) << 16) | OP(a[0])); bput(p, a[1]); bput(p, na);
+            for (uint32_t q = 3; q < WC(a[0]); q++) bput(p, a[q] == X ? f : a[q]);
+            EMIT(p, 61, l[1], nl, na);
+            *outs[k] = nl;
+        }
+        uint32_t opnd = new_img;
+        if (si_i) { const uint32_t *s = I(&e, si_i); new_si = ed_id(&e); EMIT(p, 86, s[1], new_si, new_img, new_smp); opnd = new_si; }
+        if (wrap_i) { const uint32_t *wi = I(&e, wrap_i); uint32_t ni_ = ed_id(&e); EMIT(p, 100, wi[1], ni_, opnd); opnd = ni_; }
+        /* a operação, com o operando trocado (e gradientes se era ImplicitLod) */
+        uint32_t nr = has_res ? ed_id(&e) : 0;
+        {
+            uint32_t nop = op == 87 ? 88 : op == 89 ? 90 : op;
+            uint32_t tmp[64]; uint32_t n = 0;
+            uint32_t fixed = mpos ? mpos : wc;
+            if (fixed > wc) fixed = wc;
+            for (uint32_t q = 1; q < fixed; q++) tmp[n++] = x[q];
+            if (has_res) { tmp[1] = nr; tmp[2] = opnd; } else tmp[0] = opnd;
+            if (mpos && (wc > mpos || implicit)) {
+                uint32_t nm = implicit ? ((mask & ~0x1u) | 0x4u) : mask;
+                tmp[n++] = nm;
+                uint32_t q = mpos + 1;
+                uint32_t bias = 0;
+                for (uint32_t bit = 1; bit && bit <= 0x10000; bit <<= 1) {
+                    int na_ = (mask & bit) ? imgop_nargs(bit) : 0;
+                    if (bit == 0x1 && (mask & bit)) { bias = x[q]; q += 1; if (!implicit) tmp[n++] = bias; continue; }
+                    if (bit == 0x4 && implicit) {
+                        uint32_t gx = dx, gy = dy;
+                        if (bias) {   /* bias com gradientes: escala por 2^bias */
+                            uint32_t e2 = ed_id(&e), sx = ed_id(&e), sy = ed_id(&e);
+                            uint32_t glsl = 0;
+                            for (uint32_t k = 0; k < e.i_func && !glsl; k++) { const uint32_t *y = I(&e, k); if (OP(y[0]) == 11 && !strcmp((const char *)&y[2], "GLSL.std.450")) glsl = y[1]; }
+                            const uint32_t *ctw = defw(&e, ct);
+                            if (glsl && ctw) {
+                                bput(p, (6u << 16) | 12); bput(p, t_float(&e)); bput(p, e2); bput(p, glsl); bput(p, 29); bput(p, bias);
+                                uint32_t mop = OP(ctw[0]) == 23 ? 142 : 133;   /* VectorTimesScalar / FMul */
+                                EMIT(p, mop, ct, sx, dx, e2); EMIT(p, mop, ct, sy, dy, e2);
+                                gx = sx; gy = sy;
+                            }
+                        }
+                        tmp[n++] = gx; tmp[n++] = gy;
+                        if (mask & 0x4) q += 2;
+                        continue;
+                    }
+                    for (int k = 0; k < na_; k++) tmp[n++] = x[q++];
+                    if (n > 60) break;
+                }
+            }
+            if (n > 60) goto fail;
+            bput(p, ((n + 1) << 16) | nop);
+            for (uint32_t k = 0; k < n; k++) bput(p, tmp[k]);
+        }
+        uint32_t mine = ed_id(&e);
+        EMIT(p, 170, bt, mine, X, f);                     /* OpIEqual */
+        EMIT(p, 247, L_m2, 0);
+        EMIT(p, 250, mine, L_take, L_m2);
+        EMIT(p, 248, L_take);
+        if (has_res) EMIT(p, 62, vres, nr);
+        EMIT(p, 62, vdone, cT);
+        EMIT(p, 249, L_m2);
+        EMIT(p, 248, L_m2);
+        EMIT(p, 249, L_skip);
+        EMIT(p, 248, L_skip);
+        EMIT(p, 249, L_cont);
+        EMIT(p, 248, L_cont);
+        uint32_t c2 = ed_id(&e);
+        EMIT(p, 128, it, c2, cc, c1);                     /* OpIAdd */
+        EMIT(p, 62, vctr, c2);
+        EMIT(p, 249, L_hdr);
+        EMIT(p, 248, L_merge);
+        if (has_res) EMIT(p, 61, rt, rid, vres);
+        ed_set_rep(&e, i, NULL, 0);                       /* a operação original sai */
+        if (cur_label < bound0) lab_final[cur_label] = L_merge;
+        (*count)++;
+        /* o resto do bloco continua no L_merge: OpPhi dos sucessores precisam do rótulo novo */
+        nphi_fix = 1;
+        (void)func_start;
+        if (oom) break;
+    }
+    if (!*count || oom) goto fail;
+    /* OpPhi: (valor, rótulo pai) com pai = bloco dividido -> último pedaço */
+    if (nphi_fix)
+        for (uint32_t i = e.i_func; i < e.ni; i++) {
+            const uint32_t *x = I(&e, i);
+            if (OP(x[0]) != 245) continue;
+            uint32_t wc = WC(x[0]), r[128]; int ch = 0;
+            if (wc > 128) continue;
+            memcpy(r, x, wc * 4);
+            for (uint32_t q = 4; q < wc; q += 2) if (r[q] < bound0 && lab_final[r[q]] && lab_final[r[q]] != r[q]) { r[q] = lab_final[r[q]]; ch = 1; }
+            if (ch) ed_set_rep(&e, i, r, wc);
+        }
+    /* capabilities e versão (OpGroupNonUniformBroadcastFirst = SPIR-V 1.3) */
+    int have61 = 0, have64 = 0;
+    for (uint32_t i = 0; i < e.i_func; i++) { const uint32_t *x = I(&e, i); if (OP(x[0]) == 17) { if (x[1] == 61) have61 = 1; if (x[1] == 64) have64 = 1; } }
+    if (!have61) EMIT(&e.pre[0], 17, 61);
+    if (!have64) EMIT(&e.pre[0], 17, 64);
+    if (all_frag) { int have_d = 0; for (uint32_t i = 0; i < e.i_func; i++) { const uint32_t *x = I(&e, i); if (OP(x[0]) == 17 && x[1] == 1) have_d = 1; } (void)have_d; }
+    uint32_t *out = ed_build(&e, out_nw);
+    if (out && out[1] < 0x00010300) out[1] = 0x00010300;
+    free(defi); free(nonu); free(lab_final); free(is_frag);
+    ed_free(&e);
+    return out;
+fail:
+    free(defi); free(nonu); free(lab_final); free(is_frag);
+    ed_free(&e);
+    *count = 0;
+    return NULL;
 }
